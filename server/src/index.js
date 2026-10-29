@@ -1,0 +1,94 @@
+import express from 'express';
+import cors from 'cors';
+import compression from 'compression';
+import path from 'node:path';
+import fs from 'node:fs';
+import { getDb, loadDb, flushDb, ROOT_DIR } from './db.js';
+import authRoutes from './routes/auth.js';
+import userRoutes from './routes/users.js';
+import tableRoutes from './routes/tables.js';
+import ledgerRoutes from './routes/ledger.js';
+import statsRoutes, { logsRouter } from './routes/stats.js';
+import { seed } from './seed.js';
+
+const PORT = Number(process.env.PORT) || 4399;
+
+loadDb();
+if (!getDb().users.length) {
+  seed();
+  console.log('[seed] 检测到空数据库，已写入演示数据');
+}
+
+const app = express();
+app.disable('x-powered-by');
+app.use(compression());
+app.use(cors({ origin: true, exposedHeaders: ['Content-Disposition'] }));
+app.use(express.json({ limit: '10mb' }));
+
+app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/tables', tableRoutes);
+app.use('/api/ledger', ledgerRoutes);
+app.use('/api/stats', statsRoutes);
+app.use('/api/logs', logsRouter);
+
+app.use('/api', (req, res) => res.status(404).json({ message: '接口不存在' }));
+
+// 生产模式：直接托管前端构建产物（仓库根目录的 web/dist）
+// assets 下文件名带 hash，可长期缓存；index.html 不缓存，保证发版后立刻生效
+const distDir = path.resolve(ROOT_DIR, '..', 'web', 'dist');
+if (fs.existsSync(distDir)) {
+  app.use(
+    express.static(distDir, {
+      setHeaders(res, filePath) {
+        if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        } else {
+          res.setHeader('Cache-Control', 'no-cache');
+        }
+      },
+    }),
+  );
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next();
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(path.join(distDir, 'index.html'));
+  });
+}
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ message: '提交内容过大' });
+  }
+  if (err?.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ message: '文件不能超过 20MB' });
+  }
+  const status = err.status || 500;
+  if (status >= 500) console.error('[error]', err);
+  res.status(status).json({ message: err.message || '服务器内部错误' });
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`[api] 服务已启动: http://localhost:${PORT}`);
+  if (fs.existsSync(distDir)) console.log('[api] 已托管前端静态文件 web/dist');
+});
+
+/** 优雅退出：把 120ms 防抖队列里的改动同步落盘后再关闭 */
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[api] 收到 ${signal}，正在保存数据…`);
+  try {
+    flushDb();
+  } catch (err) {
+    console.error('[api] 退出前保存失败：', err);
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => shutdown(signal));
+}
