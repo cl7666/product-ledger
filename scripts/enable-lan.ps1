@@ -29,13 +29,37 @@ if ($existing) {
 }
 
 $profiles = Get-NetConnectionProfile -ErrorAction SilentlyContinue
-$publicProfiles = $profiles | Where-Object { $_.NetworkCategory -eq 'Public' }
+# 只关心"真正插着网线/连着 WiFi、有内网 IP"的网卡，避免动到虚拟网卡
+$lanProfiles = $profiles | Where-Object {
+  $alias = $_.InterfaceAlias
+  $ips = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
+  $ips
+}
+$publicProfiles = $lanProfiles | Where-Object { $_.NetworkCategory -eq 'Public' }
+
 if ($publicProfiles) {
   Write-Host ''
-  Write-Host '注意：当前网络被识别为「公用网络」，防火墙默认拦截入站连接。' -ForegroundColor Yellow
-  Write-Host '可选做法（任选其一）：' -ForegroundColor Yellow
-  Write-Host '  1) 在 Windows 设置里把该 WiFi 改为「专用网络」（推荐，最安全）'
-  Write-Host '  2) 再执行一次本脚本并加参数 -AllowPublic：.\enable-lan.ps1 -AllowPublic'
+  Write-Host '注意：当前网络被 Windows 识别为「公用网络」，防火墙默认拦截所有入站连接，' -ForegroundColor Yellow
+  Write-Host '      所以即使加了端口规则，其他电脑也连不上。' -ForegroundColor Yellow
+  foreach ($p in $publicProfiles) {
+    Write-Host ("      网卡：{0}  网络：{1}" -f $p.InterfaceAlias, $p.Name) -ForegroundColor Yellow
+  }
+  Write-Host ''
+  $answer = Read-Host '要把这些网络改成「专用网络」吗？（家庭/公司内网建议 y；公共 WiFi 请选 n）[y/N]'
+  if ($answer -match '^(y|yes|是)$') {
+    foreach ($p in $publicProfiles) {
+      try {
+        Set-NetConnectionProfile -InterfaceAlias $p.InterfaceAlias -NetworkCategory Private -ErrorAction Stop
+        Write-Host ("✓ 已把 {0} 设为专用网络" -f $p.InterfaceAlias) -ForegroundColor Green
+      } catch {
+        Write-Host ("× 设置 {0} 失败：{1}" -f $p.InterfaceAlias, $_.Exception.Message) -ForegroundColor Red
+      }
+    }
+    Write-Host '（如需还原：Set-NetConnectionProfile -InterfaceAlias "<网卡名>" -NetworkCategory Public）' -ForegroundColor DarkGray
+  } else {
+    Write-Host '未修改网络类型。也可以改用 -AllowPublic 参数，仅对 4399 端口在公用网络上放行。' -ForegroundColor DarkGray
+  }
 }
 
 if ($PSBoundParameters.ContainsKey('AllowPublic')) {
