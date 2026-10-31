@@ -2,6 +2,7 @@ node_modules/
 dist/
 .tmp/
 *.log
+logs/
 
 # 运行时数据（需要保留时请自行备份 server/data/db.json）
 server/data/db.json

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="仓储产品台账">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f4e8c" />
+      <stop offset="1" stop-color="#3882be" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="110" fill="url(#bg)" />
+  <rect x="120" y="112" width="272" height="288" rx="28" fill="#fff" fill-opacity=".96" />
+  <circle cx="114" cy="152" r="18" fill="#143460" />
+  <circle cx="114" cy="208" r="18" fill="#143460" />
+  <circle cx="114" cy="264" r="18" fill="#143460" />
+  <circle cx="114" cy="152" r="7" fill="#fff" />
+  <circle cx="114" cy="208" r="7" fill="#fff" />
+  <circle cx="114" cy="264" r="7" fill="#fff" />
+  <rect x="188" y="150" width="150" height="26" rx="13" fill="#2f6fb3" />
+  <rect x="188" y="240" width="104" height="26" rx="13" fill="#96aac3" />
+  <rect x="188" y="298" width="128" height="26" rx="13" fill="#96aac3" />
+  <circle cx="352" cy="342" r="56" fill="#26aa82" />
+  <path d="M330 344l24 24 34-46" fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

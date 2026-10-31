@@ -3,6 +3,7 @@ import cors from 'cors';
 import compression from 'compression';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { getDb, loadDb, flushDb, ROOT_DIR } from './db.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
@@ -70,9 +71,29 @@ app.use((err, req, res, next) => {
   res.status(status).json({ message: err.message || '服务器内部错误' });
 });
 
+/** 列出本机局域网 IPv4，供控制台提示"其他电脑怎么连" */
+function lanAddresses() {
+  const list = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    for (const addr of addrs || []) {
+      const isLinkLocal = addr.address.startsWith('169.254.');
+      if (addr.family === 'IPv4' && !addr.internal && !isLinkLocal) {
+        list.push(`${addr.address}（${name}）`);
+      }
+    }
+  }
+  return list;
+}
+
+// 不指定 host：Node 默认监听所有网卡（含 IPv6），本机 localhost 与局域网 IP 都能访问
 const server = app.listen(PORT, () => {
   console.log(`[api] 服务已启动: http://localhost:${PORT}`);
   if (fs.existsSync(distDir)) console.log('[api] 已托管前端静态文件 web/dist');
+  const lan = lanAddresses();
+  if (lan.length) {
+    console.log('[api] 同一局域网的其他电脑可访问：');
+    for (const item of lan) console.log(`      http://${item.split('（')[0]}:${PORT}   ${item}`);
+  }
 });
 
 /** 优雅退出：把 120ms 防抖队列里的改动同步落盘后再关闭 */
