@@ -15,13 +15,20 @@ router.use(requireAuth);
 
 const SEARCH_KEYS = ['code', 'name', 'spec', 'category', 'warehouse', 'supplier', 'remark'];
 
+/** 成员只能维护自己录入的台账，管理员不受限（与表格行、删除权限保持同一规则） */
+function canEditLedger(user, entry) {
+  return user.role === 'admin' || entry.createdBy === user.id;
+}
+
 function decorate(entry, user) {
   const db = getDb();
+  const editable = canEditLedger(user, entry);
   return {
     ...entry,
     amount: ledgerAmount(entry),
     createdByName: db.users.find((u) => u.id === entry.createdBy)?.name || '—',
-    canDelete: user.role === 'admin' || entry.createdBy === user.id,
+    canEdit: editable,
+    canDelete: editable,
   };
 }
 
@@ -90,8 +97,16 @@ function readLedgerPayload(body) {
     if (body[f.key] === undefined) continue;
     const raw = body[f.key];
     if (f.type === 'number') {
-      const n = Number(String(raw ?? '').replace(/,/g, '').trim());
-      payload[f.key] = raw === '' || raw === null ? 0 : Number.isFinite(n) ? n : 0;
+      const text = String(raw ?? '').replace(/,/g, '').trim();
+      if (text === '') {
+        payload[f.key] = 0;
+        continue;
+      }
+      const n = Number(text);
+      if (!Number.isFinite(n)) {
+        throw new HttpError(400, `「${f.label}」必须是有效数字，收到：${String(raw).slice(0, 20)}`);
+      }
+      payload[f.key] = n;
     } else {
       payload[f.key] = String(raw ?? '').trim();
     }
@@ -136,6 +151,9 @@ router.patch('/:id', (req, res) => {
   const db = getDb();
   const entry = db.ledger.find((l) => l.id === req.params.id);
   if (!entry) throw new HttpError(404, '台账记录不存在');
+  if (!canEditLedger(req.user, entry)) {
+    throw new HttpError(403, '只能修改自己录入的台账，或联系管理员处理');
+  }
   const payload = readLedgerPayload(req.body || {});
   if (payload.code) {
     const dup = db.ledger.find(
@@ -153,7 +171,7 @@ router.delete('/:id', (req, res) => {
   const db = getDb();
   const entry = db.ledger.find((l) => l.id === req.params.id);
   if (!entry) throw new HttpError(404, '台账记录不存在');
-  if (req.user.role !== 'admin' && entry.createdBy !== req.user.id) {
+  if (!canEditLedger(req.user, entry)) {
     throw new HttpError(403, '只能删除自己创建的台账记录');
   }
   db.ledger = db.ledger.filter((l) => l.id !== entry.id);
@@ -167,7 +185,7 @@ router.post('/batch-delete', (req, res) => {
   if (!ids.length) throw new HttpError(400, '请选择要删除的记录');
   const db = getDb();
   const target = db.ledger.filter((l) => ids.includes(l.id));
-  const allowed = target.filter((l) => req.user.role === 'admin' || l.createdBy === req.user.id);
+  const allowed = target.filter((l) => canEditLedger(req.user, l));
   const allowedIds = new Set(allowed.map((l) => l.id));
   db.ledger = db.ledger.filter((l) => !allowedIds.has(l.id));
   saveDbSoon();
@@ -248,7 +266,13 @@ router.post('/import/commit', (req, res) => {
       }
       return;
     }
-    const clean = readLedgerPayload(payload);
+    let clean;
+    try {
+      clean = readLedgerPayload(payload);
+    } catch (err) {
+      if (errors.length < 30) errors.push({ row: i + 2, message: err.message || '数据格式不正确' });
+      return;
+    }
     if (!clean.name && !clean.code) {
       if (errors.length < 30) errors.push({ row: i + 2, message: '产品名称与产品编号均为空' });
       return;
@@ -257,6 +281,12 @@ router.post('/import/commit', (req, res) => {
       const key = String(clean.code || '').toLowerCase();
       const found = key ? index.get(key) : null;
       if (found) {
+        if (!canEditLedger(req.user, found)) {
+          if (errors.length < 30) {
+            errors.push({ row: i + 2, message: '无权覆盖他人录入的台账，可联系管理员处理' });
+          }
+          return;
+        }
         Object.assign(found, clean, { updatedAt: now(), updatedBy: req.user.id });
         updated += 1;
         return;

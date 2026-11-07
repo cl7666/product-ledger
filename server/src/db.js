@@ -49,10 +49,14 @@ export function saveDb() {
 }
 
 /**
- * 合并同一事件循环内的多次写入，避免每次请求都落盘。
- * 不使用 120ms 防抖：Windows 下停止脚本只能强制终止进程（无法投递 SIGTERM），
- * 防抖窗口内的改动会丢失；setTimeout(0) 把风险窗口压缩到单次事件循环。
+ * 合并短时间内的多次写入，避免每次请求都整库落盘。
+ * 首个改动触发后最多等待 SAVE_DELAY_MS，期间的新改动合并到同一次写入：
+ * 连续编辑、批量导入、脚本回放等场景下，落盘次数从「每请求一次」降到「每批一次」。
+ * 代价是强制终止（Windows 下 taskkill 无法投递 SIGTERM）最多丢失 50ms 内的改动；
+ * 正常退出（SIGINT/SIGTERM）仍由 flushDb() 同步落盘。
  */
+const SAVE_DELAY_MS = 50;
+
 export function saveDbSoon() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
@@ -62,7 +66,7 @@ export function saveDbSoon() {
     } catch (err) {
       console.error('[db] 写入失败：', err);
     }
-  }, 0);
+  }, SAVE_DELAY_MS);
   saveTimer.unref?.();
 }
 

@@ -314,7 +314,13 @@ export default function Ledger() {
       fixed: 'right',
       render: (_v, row) => (
         <Space size={2}>
-          <Button type="link" size="small" onClick={() => openEdit(row)}>
+          <Button
+            type="link"
+            size="small"
+            disabled={row.canEdit === false}
+            title={row.canEdit === false ? '只能修改自己录入的台账' : undefined}
+            onClick={() => openEdit(row)}
+          >
             编辑
           </Button>
           <Popconfirm

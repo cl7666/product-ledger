@@ -517,7 +517,104 @@ async function main() {
     check('管理员导入可更新他人的数据', adminBypass.ok && adminBypass.data.updated === 1, JSON.stringify(adminBypass.data));
     await api(`/tables/${isoId}`, { method: 'DELETE', token: adminToken });
 
-    console.log('\n== 12. 删除表格（级联）==');
+    console.log('\n== 12. 台账行级权限与数字校验 ==');
+  const ledgerAll = await api('/ledger?pageSize=50', { token: adminToken });
+  const adminOwned = ledgerAll.data.items.find((x) => x.canEdit === true && x.createdByName === '系统管理员');
+  check('台账列表返回 canEdit 标记', Boolean(adminOwned), JSON.stringify(ledgerAll.data.items.slice(0, 2)));
+  const adminOwnedName = adminOwned.name;
+
+  const memberEntry = await api('/ledger', {
+    method: 'POST',
+    token: memberToken,
+    body: { code: 'P-MEM-P1', name: '成员的台账', price: '12.5', quantity: '3' },
+  });
+  check(
+    '成员新增台账（小数保留）',
+    memberEntry.status === 201 && memberEntry.data.item.price === 12.5 && memberEntry.data.item.canEdit === true,
+    JSON.stringify(memberEntry.data),
+  );
+  const memberEntryId = memberEntry.data.item.id;
+
+  const memberEditOwn = await api(`/ledger/${memberEntryId}`, {
+    method: 'PATCH', token: memberToken, body: { name: '成员自己改名' },
+  });
+  check('成员可修改自己录入的台账', memberEditOwn.ok && memberEditOwn.data.item.name === '成员自己改名');
+
+  const memberEditOther = await api(`/ledger/${adminOwned.id}`, {
+    method: 'PATCH', token: memberToken, body: { name: '越权改名' },
+  });
+  check(
+    '成员修改他人台账被拒绝(403)',
+    memberEditOther.status === 403 && /只能修改自己/.test(memberEditOther.data?.message || ''),
+    JSON.stringify(memberEditOther.data),
+  );
+
+  const memberView = await api('/ledger?pageSize=50', { token: memberToken });
+  const otherForMember = memberView.data.items.find((x) => x.id === adminOwned.id);
+  check('成员视角他人台账 canEdit=false', otherForMember?.canEdit === false, String(otherForMember?.canEdit));
+
+  const adminEditMember = await api(`/ledger/${memberEntryId}`, {
+    method: 'PATCH', token: adminToken, body: { remark: '管理员补充' },
+  });
+  check('管理员可修改成员台账', adminEditMember.ok && adminEditMember.data.item.remark === '管理员补充');
+
+  const badPrice = await api('/ledger', {
+    method: 'POST', token: adminToken, body: { code: 'P-BAD-P1', name: '坏数字', price: 'abc' },
+  });
+  check(
+    '非法单价被拒绝(400)',
+    badPrice.status === 400 && /单价/.test(badPrice.data?.message || ''),
+    JSON.stringify(badPrice.data),
+  );
+
+  const badQuantity = await api(`/ledger/${memberEntryId}`, {
+    method: 'PATCH', token: adminToken, body: { quantity: 'x' },
+  });
+  check(
+    '非法库存数量被拒绝(400)',
+    badQuantity.status === 400 && /库存数量/.test(badQuantity.data?.message || ''),
+    JSON.stringify(badQuantity.data),
+  );
+
+  const emptyNumbers = await api('/ledger', {
+    method: 'POST', token: adminToken, body: { code: 'P-EMPTY-P1', name: '空数字', price: '', quantity: '' },
+  });
+  check(
+    '空数字仍按 0 处理',
+    emptyNumbers.status === 201 && emptyNumbers.data.item.price === 0 && emptyNumbers.data.item.quantity === 0,
+    JSON.stringify(emptyNumbers.data),
+  );
+
+  const ledgerPermXlsx = await makeXlsx([
+    ['产品编号', '产品名称'],
+    [adminOwned.code, '成员导入覆盖台账'],
+  ]);
+  const ledgerPermPreview = await api('/ledger/import/preview', {
+    method: 'POST', token: memberToken, body: toForm(ledgerPermXlsx, 'ledger-perm.xlsx'),
+  });
+  const ledgerPermCommit = await api('/ledger/import/commit', {
+    method: 'POST',
+    token: memberToken,
+    body: {
+      token: ledgerPermPreview.data.token,
+      sheet: ledgerPermPreview.data.sheets[0].name,
+      mapping: { code: 0, name: 1 },
+      mode: 'upsert',
+    },
+  });
+  check(
+    '成员导入不能覆盖他人台账',
+    ledgerPermCommit.ok && ledgerPermCommit.data.updated === 0 && ledgerPermCommit.data.failed === 1,
+    JSON.stringify(ledgerPermCommit.data),
+  );
+  const ledgerAfter = await api('/ledger?pageSize=50', { token: adminToken });
+  const adminOwnedAfter = ledgerAfter.data.items.find((x) => x.id === adminOwned.id);
+  check('他人台账内容未被改动', adminOwnedAfter?.name === adminOwnedName, String(adminOwnedAfter?.name));
+
+  await api(`/ledger/${memberEntryId}`, { method: 'DELETE', token: adminToken });
+  await api(`/ledger/${emptyNumbers.data.item.id}`, { method: 'DELETE', token: adminToken });
+
+  console.log('\n== 13. 删除表格（级联）==');
     const delTable = await api(`/tables/${tableId}`, { method: 'DELETE', token: adminToken });
     check('管理员删除表格', delTable.ok);
     check('表格已消失', (await api(`/tables/${tableId}`, { token: adminToken })).status === 404);

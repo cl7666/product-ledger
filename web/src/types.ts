@@ -66,6 +66,7 @@ export interface LedgerEntry {
   createdAt: string;
   updatedAt: string;
   createdByName?: string;
+  canEdit?: boolean;
   canDelete?: boolean;
 }
 
