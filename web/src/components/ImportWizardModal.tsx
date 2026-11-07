@@ -55,6 +55,11 @@ export default function ImportWizardModal({ open, mode, table, onCancel, onDone 
     }
   }, [open]);
 
+  // 用户取消映射去重列时，自动清空已失效的匹配键，避免提交时才报错
+  useEffect(() => {
+    if (dedupeKey && mapping[dedupeKey] === undefined) setDedupeKey(undefined);
+  }, [mapping, dedupeKey]);
+
   const targetFields: TargetField[] = useMemo(() => {
     if (mode === 'table') return (table?.columns || []) as TargetField[];
     return (preview?.fields as LedgerFieldMeta[] | undefined) || [];
@@ -117,9 +122,16 @@ export default function ImportWizardModal({ open, mode, table, onCancel, onDone 
       message.error('请至少映射一个字段');
       return;
     }
-    if (mode === 'table' && importMode === 'upsert' && !dedupeKey) {
-      message.error('请选择用于判断重复的字段');
-      return;
+    // 去重键必须真正参与映射，否则服务端按空值匹配，upsert 会静默退化成全部新增
+    if (importMode === 'upsert') {
+      if (mode === 'table' && (!dedupeKey || mapping[dedupeKey] === undefined)) {
+        message.error('请选择已映射的列作为去重字段');
+        return;
+      }
+      if (mode === 'ledger' && mapping.code === undefined) {
+        message.error('按编号更新时必须映射「产品编号」');
+        return;
+      }
     }
     setLoading(true);
     try {
@@ -174,7 +186,15 @@ export default function ImportWizardModal({ open, mode, table, onCancel, onDone 
   };
 
   return (
-    <ModalWrapper open={open} onCancel={onCancel} footer={footer()} width={900} title="从 Excel 导入数据">
+    <Modal
+      open={open}
+      onCancel={onCancel}
+      footer={footer()}
+      width={900}
+      title="从 Excel 导入数据"
+      destroyOnHidden
+      maskClosable={false}
+    >
       <Steps
         size="small"
         current={step}
@@ -306,7 +326,7 @@ export default function ImportWizardModal({ open, mode, table, onCancel, onDone 
                 <Select
                   size="small"
                   style={{ width: 150 }}
-                  value={dedupeKey}
+                  value={dedupeKey && mapping[dedupeKey] !== undefined ? dedupeKey : undefined}
                   onChange={setDedupeKey}
                   placeholder="选择唯一字段"
                   options={Object.entries(mapping)
@@ -382,36 +402,6 @@ export default function ImportWizardModal({ open, mode, table, onCancel, onDone 
           )}
         </>
       )}
-    </ModalWrapper>
-  );
-}
-
-function ModalWrapper({
-  open,
-  onCancel,
-  footer,
-  width,
-  title,
-  children,
-}: {
-  open: boolean;
-  onCancel: () => void;
-  footer: React.ReactNode;
-  width: number;
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <Modal
-      open={open}
-      onCancel={onCancel}
-      footer={footer}
-      width={width}
-      title={title}
-      destroyOnClose
-      maskClosable={false}
-    >
-      {children}
     </Modal>
   );
 }

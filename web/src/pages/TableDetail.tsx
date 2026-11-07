@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Alert,
@@ -91,6 +91,8 @@ export default function TableDetail() {
   const [resizing, setResizing] = useState<{ key: string; width: number } | null>(null);
 
   const applyFilters = (next: FilterCond[]) => {
+    // 筛选变化后立即清空选择，避免隐藏行被批量删除
+    setSelected([]);
     patchUrl({ filters: next.length ? JSON.stringify(next) : '', page: 1 });
   };
 
@@ -109,6 +111,10 @@ export default function TableDetail() {
     }
   };
 
+  // 拖拽列宽时挂在 window 上的监听需要在组件卸载时清理，避免向已卸载页面发请求
+  const resizeCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => () => resizeCleanup.current?.(), []);
+
   const startResize = (event: React.MouseEvent, key: string, startWidth: number) => {
     if (!meta || !canEditTable) return;
     event.preventDefault();
@@ -122,12 +128,17 @@ export default function TableDetail() {
     const onUp = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      resizeCleanup.current = null;
       setResizing(null);
       const columns = meta.columns.map((c) => (c.key === key ? { ...c, width } : c));
       saveColumns(columns, `列宽已保存为 ${width}px`);
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    resizeCleanup.current = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
   };
 
   const dropColumn = (targetKey: string) => {
@@ -183,12 +194,14 @@ export default function TableDetail() {
       });
       setRows(data.items);
       setTotal(data.total);
+      // 服务端会把越界页码收敛到最后一页；回写 URL，避免 UI 停在空白页
+      if (data.page !== page) patchUrl({ page: data.page });
     } catch (err) {
       message.error((err as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [id, keyword, filters, sort, page, pageSize, message]);
+  }, [id, keyword, filters, sort, page, pageSize, message, patchUrl]);
 
   useEffect(() => {
     loadMeta();
@@ -245,7 +258,12 @@ export default function TableDetail() {
             className: dragKey === col.key ? 'th-dragging' : dropKey === col.key && dragKey ? 'th-drop-target' : '',
             draggable: canEditTable,
             title: canEditTable ? '拖动表头可调整列顺序' : '',
-            onDragStart: () => setDragKey(col.key),
+            onDragStart: (e: React.DragEvent<HTMLElement>) => {
+              // Firefox 需要显式写入 dataTransfer 才会触发后续 drop
+              e.dataTransfer.setData('text/plain', col.key);
+              e.dataTransfer.effectAllowed = 'move';
+              setDragKey(col.key);
+            },
             onDragEnd: () => {
               setDragKey(null);
               setDropKey(null);
@@ -297,6 +315,7 @@ export default function TableDetail() {
               try {
                 await api.tables.deleteRow(id!, row.id);
                 message.success('已删除');
+                setSelected((prev) => prev.filter((k) => k !== row.id));
                 loadRows();
                 loadMeta();
               } catch (err) {
@@ -402,10 +421,6 @@ export default function TableDetail() {
     });
   };
 
-  if (!meta && !metaLoading) {
-    return <Empty description="表格不存在或已被删除" />;
-  }
-
   return (
     <>
       <div style={{ marginBottom: 8 }}>
@@ -454,7 +469,7 @@ export default function TableDetail() {
         </Space>
       </div>
 
-      <Card className="panel" bordered={false} styles={{ body: { padding: 16 } }}>
+      <Card className="panel" variant="borderless" styles={{ body: { padding: 16 } }}>
         <div className="table-toolbar">
           <Input.Search
             className="search-box"
@@ -466,6 +481,7 @@ export default function TableDetail() {
               if (!e.target.value) patchUrl({ keyword: '', page: 1 });
             }}
             onSearch={(v) => {
+              setSelected([]);
               patchUrl({ keyword: v.trim(), page: 1 });
             }}
             enterButton="搜索"

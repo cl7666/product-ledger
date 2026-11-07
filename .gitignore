@@ -4,8 +4,12 @@ dist/
 *.log
 logs/
 
+# 编辑器 / 本地工具配置
+.codebuddy/
+.vscode/
+.idea/
+
 # 运行时数据（需要保留时请自行备份 server/data/db.json）
-server/data/db.json
-server/data/jwt.secret
-server/data/test-db.json
-server/data/prod-check-db.json
+# 通配所有临时数据库与密钥，避免 probe-/tmp- 之类的测试库误入版本库
+server/data/*.json
+server/data/*.secret

@@ -58,6 +58,7 @@ export function downloadFile(path: string, fallbackName: string) {
     .then(async (res) => {
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
+        if (res.status === 401) unauthorizedHandler?.();
         throw new Error(data.message || '下载失败');
       }
       const blob = await res.blob();
@@ -95,11 +96,27 @@ function rowParams(q: RowQuery = {}) {
   };
 }
 
+/** 序列化查询参数：跳过 undefined，保留 number 原样转换，避免用 as 断言掩盖类型 */
+function toQuery(params: Record<string, unknown>) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) search.set(key, String(value));
+  }
+  return search.toString();
+}
+
 export const api = {
   login: (username: string, password: string) =>
     http.post<{ token: string; user: User }>('/auth/login', { username, password }).then((r) => r.data),
   me: () => http.get<{ user: User }>('/auth/me').then((r) => r.data.user),
-  logout: () => http.post('/auth/logout').catch(() => undefined),
+  logout: () => {
+    // 显式带上当前 token：调用方会紧接着清空本地 token，
+    // 若依赖请求拦截器再读取，会读到空值导致 401（退出日志丢失）
+    const token = tokenStore.get();
+    return http
+      .post('/auth/logout', null, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined)
+      .catch(() => undefined);
+  },
   changePassword: (oldPassword: string, newPassword: string) =>
     http.post<{ message: string }>('/auth/password', { oldPassword, newPassword }).then((r) => r.data),
   updateProfile: (body: { name?: string; avatar?: string | null }) =>
@@ -123,10 +140,6 @@ export const api = {
       http
         .get<Paged<DataRow>>(`/tables/${id}/rows`, { params: rowParams(q) })
         .then((r) => r.data),
-    allRows: (id: string, q?: RowQuery) =>
-      http
-        .get<{ items: DataRow[]; total: number }>(`/tables/${id}/rows/all`, { params: rowParams(q) })
-        .then((r) => r.data),
     createRow: (id: string, data: Record<string, unknown>) =>
       http.post<{ row: DataRow }>(`/tables/${id}/rows`, data).then((r) => r.data.row),
     updateRow: (id: string, rowId: string, data: Record<string, unknown>) =>
@@ -138,12 +151,7 @@ export const api = {
         .post<{ deleted: number; skipped: number; message: string }>(`/tables/${id}/rows/batch-delete`, { ids })
         .then((r) => r.data),
     export: (id: string, q?: RowQuery) =>
-      downloadFile(
-        `/tables/${id}/export?${new URLSearchParams(
-          Object.entries(rowParams(q)).filter(([, v]) => v !== undefined) as [string, string][],
-        ).toString()}`,
-        '表格导出.xlsx',
-      ),
+      downloadFile(`/tables/${id}/export?${toQuery(rowParams(q))}`, '表格导出.xlsx'),
     syncLedger: (
       id: string,
       body: { rowIds?: string[]; scope: 'all' | 'selected'; mode: 'upsert' | 'insert'; mapping: Record<string, string> },
@@ -175,12 +183,6 @@ export const api = {
           params: { ...rowParams(q), category: q?.category, status: q?.status, warehouse: q?.warehouse },
         })
         .then((r) => r.data),
-    all: (q?: RowQuery & { category?: string; status?: string; warehouse?: string }) =>
-      http
-        .get<{ items: LedgerEntry[]; total: number }>('/ledger/all', {
-          params: { ...rowParams(q), category: q?.category, status: q?.status, warehouse: q?.warehouse },
-        })
-        .then((r) => r.data),
     create: (body: Partial<LedgerEntry>) =>
       http.post<{ item: LedgerEntry }>('/ledger', body).then((r) => r.data.item),
     update: (id: string, body: Partial<LedgerEntry>) =>
@@ -192,14 +194,12 @@ export const api = {
         .then((r) => r.data),
     export: (q?: RowQuery & { category?: string; status?: string; warehouse?: string }) =>
       downloadFile(
-        `/ledger/export?${new URLSearchParams(
-          Object.entries({
-            ...rowParams(q),
-            category: q?.category,
-            status: q?.status,
-            warehouse: q?.warehouse,
-          }).filter(([, v]) => v !== undefined) as [string, string][],
-        ).toString()}`,
+        `/ledger/export?${toQuery({
+          ...rowParams(q),
+          category: q?.category,
+          status: q?.status,
+          warehouse: q?.warehouse,
+        })}`,
         '产品台账.xlsx',
       ),
     template: () => downloadFile('/ledger/template', '产品台账导入模板.xlsx'),

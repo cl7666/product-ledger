@@ -42,7 +42,7 @@ const newKey = () => `f_${Math.random().toString(36).slice(2, 10)}`;
 export default function ColumnManagerModal({ open, columns, rowCount, onCancel, onSave }: Props) {
   const [cols, setCols] = useState<TableColumn[]>([]);
   const [saving, setSaving] = useState(false);
-  const { message } = AntdApp.useApp();
+  const { message, modal } = AntdApp.useApp();
 
   useEffect(() => {
     if (open) setCols(columns.map((c) => ({ ...c })));
@@ -98,7 +98,7 @@ export default function ColumnManagerModal({ open, columns, rowCount, onCancel, 
     }
     const removed = columns.filter((c) => !cols.some((n) => n.key === c.key));
     if (removed.length && rowCount > 0) {
-      Modal.confirm({
+      modal.confirm({
         title: '确认删除字段？',
         content: `将删除 ${removed.map((c) => `「${c.label}」`).join('、')}，这些字段已有的 ${rowCount} 行数据会被清空，无法恢复。`,
         okText: '确认删除',
@@ -125,7 +125,7 @@ export default function ColumnManagerModal({ open, columns, rowCount, onCancel, 
       okText="保存字段"
       cancelText="取消"
       width={860}
-      destroyOnClose
+      destroyOnHidden
       maskClosable={false}
     >
       <Alert

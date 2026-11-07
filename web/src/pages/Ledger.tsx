@@ -105,7 +105,8 @@ export default function Ledger() {
     load();
   }, [load]);
 
-  useEffect(() => {
+  // 分类 / 仓库选项来自台账实际数据，新增记录后需要重新拉取
+  const loadFacets = useCallback(() => {
     api.stats()
       .then((s) => {
         setWarehouses(s.warehouses || []);
@@ -114,6 +115,10 @@ export default function Ledger() {
       })
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    loadFacets();
+  }, [loadFacets]);
 
   const pageAmount = useMemo(() => items.reduce((sum, r) => sum + (Number(r.amount) || 0), 0), [items]);
 
@@ -155,6 +160,8 @@ export default function Ledger() {
       }
       setFormOpen(false);
       load();
+      // 新增的仓库 / 分类要立刻出现在筛选下拉里
+      loadFacets();
     } catch (err) {
       if ((err as { errorFields?: unknown }).errorFields) return;
       message.error((err as Error).message);
@@ -358,7 +365,7 @@ export default function Ledger() {
         </Space>
       </div>
 
-      <Card className="panel" bordered={false} styles={{ body: { padding: 16 } }}>
+      <Card className="panel" variant="borderless" styles={{ body: { padding: 16 } }}>
         <div className="table-toolbar">
           <Input.Search
             className="search-box"
@@ -473,7 +480,7 @@ export default function Ledger() {
         okText="保存"
         cancelText="取消"
         width={720}
-        destroyOnClose
+        destroyOnHidden
         maskClosable={false}
       >
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
@@ -525,7 +532,10 @@ export default function Ledger() {
         open={importOpen}
         mode="ledger"
         onCancel={() => setImportOpen(false)}
-        onDone={() => load()}
+        onDone={() => {
+          load();
+          loadFacets();
+        }}
       />
 
       <ToTableModal

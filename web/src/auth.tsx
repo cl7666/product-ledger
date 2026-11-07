@@ -26,8 +26,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const me = await api.me();
       setUser(me);
-    } catch {
-      tokenStore.clear();
+    } catch (err) {
+      // 只有明确的鉴权失败才清除 token；后端重启、代理 502、超时不应把用户踢下线
+      const status = (err as { status?: number }).status;
+      if (status === 401 || status === 403) tokenStore.clear();
       setUser(null);
     }
   }, []);

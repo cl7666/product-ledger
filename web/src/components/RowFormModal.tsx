@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { DatePicker, Form, Input, InputNumber, Modal, Select, App as AntdApp } from 'antd';
 import dayjs from 'dayjs';
 import type { DataRow, DataTable } from '../types';
@@ -15,6 +15,7 @@ interface Props {
 export default function RowFormModal({ open, table, row, onCancel, onSaved }: Props) {
   const [form] = Form.useForm();
   const { message } = AntdApp.useApp();
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -31,6 +32,8 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
   }, [open, row, table.columns, form]);
 
   const submit = async () => {
+    // 提交中禁止再次触发，避免连点产生重复数据
+    if (saving) return;
     try {
       const values = await form.validateFields();
       const payload: Record<string, unknown> = {};
@@ -40,6 +43,7 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
         else if (col.type === 'number') payload[col.key] = raw === undefined || raw === null ? '' : Number(raw);
         else payload[col.key] = raw ?? '';
       }
+      setSaving(true);
       if (row) {
         await api.tables.updateRow(table.id, row.id, payload);
         message.success('数据已更新');
@@ -48,10 +52,11 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
         message.success('数据已添加');
       }
       onSaved();
-      onCancel();
     } catch (err) {
       if ((err as { errorFields?: unknown }).errorFields) return;
       message.error((err as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -63,8 +68,9 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
       onOk={submit}
       okText="保存"
       cancelText="取消"
+      confirmLoading={saving}
       width={680}
-      destroyOnClose
+      destroyOnHidden
       maskClosable={false}
     >
       <Form form={form} layout="vertical" style={{ marginTop: 16 }}>

@@ -184,7 +184,7 @@ export default function TableList() {
         okText="创建"
         cancelText="取消"
         width={560}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" style={{ marginTop: 8 }} preserve={false}>
           <Form.Item

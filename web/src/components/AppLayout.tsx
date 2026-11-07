@@ -52,7 +52,7 @@ export default function AppLayout() {
   const { user, isAdmin, logout, setUser } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
-  const { message } = AntdApp.useApp();
+  const { message, modal } = AntdApp.useApp();
   const [collapsed, setCollapsed] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [pwdOpen, setPwdOpen] = useState(false);
@@ -88,14 +88,17 @@ export default function AppLayout() {
   ];
 
   const submitPassword = async () => {
-    const values = await pwdForm.validateFields();
-    setSaving(true);
+    if (saving) return;
     try {
+      const values = await pwdForm.validateFields();
+      setSaving(true);
       await api.changePassword(values.oldPassword, values.newPassword);
       message.success('密码已更新，下次登录请使用新密码');
       setPwdOpen(false);
       pwdForm.resetFields();
     } catch (err) {
+      // 表单校验失败时 errorFields 存在，静默返回，避免未处理的 Promise rejection
+      if ((err as { errorFields?: unknown }).errorFields) return;
       message.error((err as Error).message);
     } finally {
       setSaving(false);
@@ -120,21 +123,23 @@ export default function AppLayout() {
   };
 
   const submitProfile = async () => {
-    const values = await profileForm.validateFields();
-    const body: { name?: string; avatar?: string | null } = {};
-    if (values.name && values.name !== user?.name) body.name = String(values.name).trim();
-    if (avatarDraft !== undefined) body.avatar = avatarDraft || null;
-    if (!Object.keys(body).length) {
-      message.info('没有需要保存的修改');
-      return;
-    }
-    setSavingProfile(true);
+    if (savingProfile) return;
     try {
+      const values = await profileForm.validateFields();
+      const body: { name?: string; avatar?: string | null } = {};
+      if (values.name && values.name !== user?.name) body.name = String(values.name).trim();
+      if (avatarDraft !== undefined) body.avatar = avatarDraft || null;
+      if (!Object.keys(body).length) {
+        message.info('没有需要保存的修改');
+        return;
+      }
+      setSavingProfile(true);
       const res = await api.updateProfile(body);
       setUser(res.user);
       message.success('资料已更新');
       setProfileOpen(false);
     } catch (err) {
+      if ((err as { errorFields?: unknown }).errorFields) return;
       message.error((err as Error).message);
     } finally {
       setSavingProfile(false);
@@ -205,7 +210,7 @@ export default function AppLayout() {
                 if (key === 'profile') openProfile();
                 if (key === 'pwd') setPwdOpen(true);
                 if (key === 'logout') {
-                  Modal.confirm({
+                  modal.confirm({
                     title: '确认退出登录？',
                     okText: '退出',
                     cancelText: '取消',
@@ -256,7 +261,7 @@ export default function AppLayout() {
         okText="保存"
         cancelText="取消"
         width={480}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={profileForm} layout="vertical" style={{ marginTop: 16 }}>
           <Form.Item label="头像">
@@ -313,7 +318,7 @@ export default function AppLayout() {
         confirmLoading={saving}
         okText="保存"
         cancelText="取消"
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={pwdForm} layout="vertical" style={{ marginTop: 16 }}>
           <Form.Item name="oldPassword" label="原密码" rules={[{ required: true, message: '请输入原密码' }]}>

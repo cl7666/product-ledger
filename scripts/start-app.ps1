@@ -1,9 +1,14 @@
 ﻿# 仓储产品台账 —— 一键启动脚本
 # 双击「启动台账系统.cmd」即会执行本脚本：检查环境 → 必要时安装/构建 → 后台启动服务 → 打开浏览器
+# 可选参数：
+#   -Port 4399     指定端口（会通过 PORT 环境变量传给服务端）
+#   -Rebuild       强制重新构建前端
+#   -NoBrowser     不自动打开浏览器（脚本化/测试用）
 
 param(
-  [switch]$NoBrowser,      # 内部测试用：不自动打开浏览器
-  [int]$Port = 4399
+  [switch]$NoBrowser,
+  [int]$Port = 4399,
+  [switch]$Rebuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +22,7 @@ function Pause-IfNeeded {
 
 $url    = "http://127.0.0.1:$Port"
 $logDir = Join-Path $root 'logs'
+$pidFile = Join-Path $logDir 'server.pid'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 function Test-PortOpen([int]$p) {
@@ -24,6 +30,14 @@ function Test-PortOpen([int]$p) {
   try { $client.Connect('127.0.0.1', $p); return $true }
   catch { return $false }
   finally { $client.Dispose() }
+}
+
+# 端口通不代表是本系统：必须 /api/health 返回 200
+function Test-ServiceUp([int]$p) {
+  try {
+    $resp = Invoke-WebRequest "http://127.0.0.1:$p/api/health" -UseBasicParsing -TimeoutSec 2
+    return ($resp.StatusCode -eq 200)
+  } catch { return $false }
 }
 
 function Get-LanIps {
@@ -47,22 +61,57 @@ function Show-Lan {
   Write-Host '（对方打不开时，请看 README「局域网共享」一节，或用「启用局域网访问.cmd」放行防火墙）' -ForegroundColor DarkGray
 }
 
+# 前端源文件是否比 dist 新（dist 不随代码更新分发，必须自己判断）
+function Test-NeedBuild {
+  $distIndex = Join-Path $root 'web\dist\index.html'
+  if (-not (Test-Path $distIndex)) { return $true }
+  $targets = @(
+    (Join-Path $root 'web\src'),
+    (Join-Path $root 'web\public'),
+    (Join-Path $root 'web\index.html'),
+    (Join-Path $root 'web\vite.config.ts'),
+    (Join-Path $root 'web\package.json')
+  ) | Where-Object { Test-Path $_ }
+  if (-not $targets) { return $false }
+  $newest = Get-ChildItem -Path $targets -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if (-not $newest) { return $false }
+  return ($newest.LastWriteTime -gt (Get-Item $distIndex).LastWriteTime)
+}
+
 Write-Host '=======================================' -ForegroundColor DarkCyan
 Write-Host '   仓储产品台账管理系统 · 本地启动' -ForegroundColor Cyan
 Write-Host '=======================================' -ForegroundColor DarkCyan
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Host '没有找到 Node.js。请先安装 Node.js 18 或更高版本：https://nodejs.org/' -ForegroundColor Red
+  Write-Host '没有找到 Node.js。请先安装 Node.js 20 或更高版本：https://nodejs.org/' -ForegroundColor Red
+  Pause-IfNeeded
+  exit 1
+}
+
+# 版本校验：Vite 6 / 本项目 engines 均要求 >= 20
+$nodeVersion = (& node -p "process.versions.node" 2>$null)
+$nodeMajor = 0
+[void][int]::TryParse(($nodeVersion -split '\.')[0], [ref]$nodeMajor)
+if ($nodeMajor -lt 20) {
+  Write-Host "当前 Node.js 版本为 $nodeVersion，本项目需要 20 或更高版本。" -ForegroundColor Red
   Pause-IfNeeded
   exit 1
 }
 
 if (Test-PortOpen $Port) {
-  Write-Host "服务已经在运行（端口 $Port），直接打开页面。" -ForegroundColor Yellow
-  if (-not $NoBrowser) { Start-Process $url }
-  Show-Lan
-  Start-Sleep -Seconds 2
-  exit 0
+  if (Test-ServiceUp $Port) {
+    Write-Host "服务已经在运行（端口 $Port），直接打开页面。" -ForegroundColor Yellow
+    if (-not $NoBrowser) { Start-Process $url }
+    Show-Lan
+    Start-Sleep -Seconds 2
+    exit 0
+  }
+  Write-Host "端口 $Port 已被其他程序占用（访问 /api/health 无效），无法启动。" -ForegroundColor Red
+  Write-Host '请关闭占用该端口的程序，或用 -Port 指定其他端口。' -ForegroundColor DarkGray
+  Pause-IfNeeded
+  exit 1
 }
 
 if (-not (Test-Path (Join-Path $root 'node_modules'))) {
@@ -75,8 +124,9 @@ if (-not (Test-Path (Join-Path $root 'node_modules'))) {
   }
 }
 
-if (-not (Test-Path (Join-Path $root 'web\dist\index.html'))) {
-  Write-Host '正在构建前端页面…' -ForegroundColor Yellow
+if ($Rebuild -or (Test-NeedBuild)) {
+  if ($Rebuild) { Write-Host '按要求重新构建前端页面…' -ForegroundColor Yellow }
+  else { Write-Host '检测到前端源码已更新，正在重新构建页面…' -ForegroundColor Yellow }
   npm run build
   if ($LASTEXITCODE -ne 0) {
     Write-Host '前端构建失败，请查看上面的报错。' -ForegroundColor Red
@@ -88,28 +138,39 @@ if (-not (Test-Path (Join-Path $root 'web\dist\index.html'))) {
 Write-Host '正在启动服务…' -ForegroundColor Yellow
 $outLog = Join-Path $logDir 'server.log'
 $errLog = Join-Path $logDir 'server.err.log'
-$node   = (Get-Command node).Source
+# 覆盖式重定向会丢失上次排障线索，启动前保留一份上一版日志
+foreach ($file in @($outLog, $errLog)) {
+  if (Test-Path $file) { Move-Item -Path $file -Destination "$file.prev" -Force }
+}
+$node = (Get-Command node).Source
 
-Start-Process -FilePath $node `
+# 关键：把端口通过环境变量传给子进程，否则服务端恒监听 4399
+$env:PORT = "$Port"
+
+$proc = Start-Process -FilePath $node `
   -ArgumentList 'src/index.js' `
   -WorkingDirectory (Join-Path $root 'server') `
   -WindowStyle Hidden `
   -RedirectStandardOutput $outLog `
-  -RedirectStandardError  $errLog
+  -RedirectStandardError  $errLog `
+  -PassThru
+
+$proc.Id | Set-Content -Path $pidFile -Encoding ASCII
 
 $ok = $false
 for ($i = 0; $i -lt 60; $i++) {
   Start-Sleep -Milliseconds 500
-  try {
-    $resp = Invoke-WebRequest "$url/api/health" -UseBasicParsing -TimeoutSec 2
-    if ($resp.StatusCode -eq 200) { $ok = $true; break }
-  } catch { }
+  if (Test-ServiceUp $Port) { $ok = $true; break }
+  if ($proc.HasExited) { break }
 }
 
 if (-not $ok) {
   Write-Host '启动失败，最后几行日志如下：' -ForegroundColor Red
   if (Test-Path $errLog) { Get-Content $errLog -Tail 20 -Encoding UTF8 }
   if (Test-Path $outLog) { Get-Content $outLog -Tail 20 -Encoding UTF8 }
+  # 清理残留进程，避免占用端口
+  if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+  Remove-Item -Path $pidFile -ErrorAction SilentlyContinue
   Pause-IfNeeded
   exit 1
 }

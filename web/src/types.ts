@@ -126,7 +126,6 @@ export interface Stats {
   totalValue: number;
   totalQuantity: number;
   byCategory: Record<string, number>;
-  byStatus: Record<string, number>;
   lowStock: { id: string; code: string; name: string; quantity: number; warehouse: string; unit: string }[];
   recentTables: { id: string; name: string; rowCount: number; updatedAt: string; ownerName: string }[];
   recentLogs: LogItem[];

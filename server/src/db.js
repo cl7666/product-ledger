@@ -48,7 +48,11 @@ export function saveDb() {
   fs.renameSync(tmp, DB_FILE);
 }
 
-/** 合并高频写入，避免每次请求都落盘 */
+/**
+ * 合并同一事件循环内的多次写入，避免每次请求都落盘。
+ * 不使用 120ms 防抖：Windows 下停止脚本只能强制终止进程（无法投递 SIGTERM），
+ * 防抖窗口内的改动会丢失；setTimeout(0) 把风险窗口压缩到单次事件循环。
+ */
 export function saveDbSoon() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
@@ -58,7 +62,7 @@ export function saveDbSoon() {
     } catch (err) {
       console.error('[db] 写入失败：', err);
     }
-  }, 120);
+  }, 0);
   saveTimer.unref?.();
 }
 

@@ -307,16 +307,30 @@ router.post(
 router.post('/:id/import/commit', (req, res) => {
   const table = findTableOr404(req, res);
   if (!table) return;
-  const { token, sheet, mapping, mode = 'append', dedupeKey } = req.body || {};
-  const session = getSession(token, req.user.id);
-  if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
-  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
-  if (!source) throw new HttpError(400, '找不到对应的工作表');
+  const { token, sheet, mapping, dedupeKey } = req.body || {};
+  const mode = String(req.body?.mode ?? 'append').toLowerCase();
 
+  // 参数校验放在读取导入会话之前：请求体本身就非法时，不该先消耗会话或返回「会话过期」
+  if (!['append', 'upsert'].includes(mode)) {
+    throw new HttpError(400, '导入方式只能是 append（追加）或 upsert（按字段匹配更新）');
+  }
   const pairs = Object.entries(mapping || {})
     .map(([colKey, headerIndex]) => [colKey, Number(headerIndex)])
     .filter(([colKey, idx]) => table.columns.some((c) => c.key === colKey) && Number.isInteger(idx) && idx >= 0);
   if (!pairs.length) throw new HttpError(400, '请至少映射一个字段');
+  // upsert 必须有匹配字段，且该字段要真的参与映射；否则 existing 永远为空，会静默退化成全部新增
+  if (mode === 'upsert') {
+    if (!dedupeKey) throw new HttpError(400, '按字段匹配更新时必须指定用于判断重复的字段');
+    if (!pairs.some(([colKey]) => colKey === dedupeKey)) {
+      throw new HttpError(400, '用于判断重复的字段必须参与列映射');
+    }
+  }
+
+  const session = getSession(token, req.user.id);
+  if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
+  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
+  if (!source) throw new HttpError(400, '找不到对应的工作表');
+  const dedupeLabel = table.columns.find((c) => c.key === dedupeKey)?.label || '匹配字段';
 
   const db = getDb();
   const existing = new Map();
@@ -355,8 +369,21 @@ router.post('/:id/import/commit', (req, res) => {
     }
     if (mode === 'upsert' && dedupeKey) {
       const key = String(data[dedupeKey] ?? '').trim().toLowerCase();
-      if (key && existing.has(key)) {
+      if (!key) {
+        if (errors.length < 30) {
+          errors.push({ row: index + 2, message: `「${dedupeLabel}」为空，无法判断是否与已有数据重复` });
+        }
+        return;
+      }
+      if (existing.has(key)) {
         const target = existing.get(key);
+        // 行级权限：与单条 PATCH 保持一致，导入也不能覆盖别人录入的数据
+        if (!canEditRow(req.user, table, target)) {
+          if (errors.length < 30) {
+            errors.push({ row: index + 2, message: '无权覆盖他人录入的数据，可联系表格创建者或管理员处理' });
+          }
+          return;
+        }
         target.data = { ...target.data, ...data };
         target.updatedAt = now();
         target.updatedBy = req.user.id;

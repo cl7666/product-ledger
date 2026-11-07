@@ -91,7 +91,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
       okText={`写入 ${selectedIds.length} 条`}
       cancelText="取消"
       width={760}
-      destroyOnClose
+      destroyOnHidden
       maskClosable={false}
     >
       <Alert

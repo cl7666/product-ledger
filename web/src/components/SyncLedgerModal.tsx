@@ -88,7 +88,7 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
       okText="开始同步"
       cancelText="取消"
       width={760}
-      destroyOnClose
+      destroyOnHidden
       maskClosable={false}
     >
       <Alert

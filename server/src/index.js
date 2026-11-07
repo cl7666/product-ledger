@@ -23,7 +23,37 @@ if (!getDb().users.length) {
 const app = express();
 app.disable('x-powered-by');
 app.use(compression());
-app.use(cors({ origin: true, exposedHeaders: ['Content-Disposition'] }));
+
+// 基础安全响应头（不引入 CSP：antd 依赖内联样式，强 CSP 会破坏渲染）
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
+
+// CORS 收敛：允许无 Origin（同源导航 / curl）、同源 Host、以及本机开发端口；
+// 不再反射任意来源，避免其他站点直接调用内网接口
+const DEV_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
+app.use(
+  cors((req, callback) => {
+    const origin = req.headers.origin;
+    let allowed = !origin;
+    if (origin) {
+      if (DEV_ORIGIN.test(origin)) {
+        allowed = true;
+      } else {
+        try {
+          allowed = new URL(origin).host === (req.headers.host || '');
+        } catch {
+          allowed = false;
+        }
+      }
+    }
+    callback(null, { origin: allowed, exposedHeaders: ['Content-Disposition'] });
+  }),
+);
+
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
@@ -53,6 +83,8 @@ if (fs.existsSync(distDir)) {
   );
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) return next();
+    // 带扩展名的大概率是静态资源：缺失时明确 404，避免把 index.html 当图片返回
+    if (path.extname(req.path)) return res.status(404).type('text/plain').send('Not Found');
     res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(path.join(distDir, 'index.html'));
   });

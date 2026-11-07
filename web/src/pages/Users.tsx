@@ -223,7 +223,7 @@ export default function Users() {
         description="管理员拥有：删除任意表格、管理用户、查看操作日志、删除任意数据的权限。"
       />
 
-      <Card className="panel" bordered={false} styles={{ body: { padding: 16 } }}>
+      <Card className="panel" variant="borderless" styles={{ body: { padding: 16 } }}>
         <div className="table-toolbar">
           <Input.Search
             className="search-box"
@@ -257,7 +257,7 @@ export default function Users() {
         okText="保存"
         cancelText="取消"
         width={480}
-        destroyOnClose
+        destroyOnHidden
         maskClosable={false}
       >
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>

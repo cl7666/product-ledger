@@ -216,6 +216,13 @@ router.post('/import/commit', (req, res) => {
     .map(([field, index]) => [field, Number(index)])
     .filter(([field, idx]) => LEDGER_WRITABLE_FIELDS.some((f) => f.key === field) && Number.isInteger(idx) && idx >= 0);
   if (!pairs.length) throw new HttpError(400, '请至少映射一个台账字段');
+  // upsert 必须真正拿到编号，否则会把"更新"静默降级成"全部新增"
+  if (mode === 'upsert') {
+    if (dedupeKey !== 'code') throw new HttpError(400, '台账导入仅支持按「产品编号」匹配更新');
+    if (!pairs.some(([field]) => field === 'code')) {
+      throw new HttpError(400, '按编号更新时必须映射「产品编号」列');
+    }
+  }
 
   const index = new Map();
   for (const l of db.ledger) {

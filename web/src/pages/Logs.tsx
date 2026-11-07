@@ -114,7 +114,7 @@ export default function Logs() {
         </Button>
       </div>
 
-      <Card className="panel" bordered={false} styles={{ body: { padding: 16 } }}>
+      <Card className="panel" variant="borderless" styles={{ body: { padding: 16 } }}>
         <div className="table-toolbar">
           <Input.Search
             className="search-box"

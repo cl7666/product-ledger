@@ -30,7 +30,8 @@ export function publicUser(user) {
 /** 每次请求都从库里取最新用户，保证被删除/降权的账号立刻失效 */
 export function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : req.query.token;
+  // 只接受 Authorization 头：查询串里的 token 会进入访问日志 / Referer
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   if (!token) return res.status(401).json({ message: '请先登录' });
   try {
     const payload = jwt.verify(token, SECRET);

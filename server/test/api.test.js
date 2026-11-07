@@ -427,7 +427,97 @@ async function main() {
     check('转交后数据仍可编辑', tempTableRows.data.items[0].canEdit === true);
     await api(`/tables/${tempTable.data.table.id}`, { method: 'DELETE', token: adminToken });
 
-    console.log('\n== 11. 删除表格（级联）==');
+    console.log('\n== 11. 导入参数与行级权限（回归）==');
+    const isoTable = await api('/tables', {
+      method: 'POST',
+      token: adminToken,
+      body: {
+        name: '导入权限回归表',
+        columns: [
+          { label: '编号', key: 'code', type: 'text', required: true },
+          { label: '名称', key: 'name', type: 'text', required: true },
+        ],
+      },
+    });
+    const isoId = isoTable.data.table.id;
+    const isoRow = await api(`/tables/${isoId}/rows`, {
+      method: 'POST', token: adminToken, body: { code: 'ADM-1', name: '管理员录入' },
+    });
+    check('回归表准备完成', isoTable.status === 201 && isoRow.status === 201, JSON.stringify(isoTable.data));
+
+    const isoXlsx = await makeXlsx([
+      ['编号', '名称'],
+      ['ADM-1', '成员导入覆盖'],
+    ]);
+    const memberPreview = await api(`/tables/${isoId}/import/preview`, {
+      method: 'POST', token: memberToken, body: toForm(isoXlsx, 'perm-member.xlsx'),
+    });
+    const memberSheet = memberPreview.data.sheets[0].name;
+
+    const noDedupe = await api(`/tables/${isoId}/import/commit`, {
+      method: 'POST',
+      token: memberToken,
+      body: { token: memberPreview.data.token, sheet: memberSheet, mapping: { code: 0, name: 1 }, mode: 'upsert' },
+    });
+    check('upsert 未指定去重字段被拒绝(400)', noDedupe.status === 400, JSON.stringify(noDedupe.data));
+
+    const badMode = await api(`/tables/${isoId}/import/commit`, {
+      method: 'POST',
+      token: memberToken,
+      body: { token: memberPreview.data.token, sheet: memberSheet, mapping: { code: 0, name: 1 }, mode: 'merge' },
+    });
+    check('非法导入方式被拒绝(400)', badMode.status === 400, JSON.stringify(badMode.data));
+
+    // 参数校验应先于会话校验：即使 token 无效，也应报「导入方式」而不是「会话过期」
+    const badModeNoSession = await api(`/tables/${isoId}/import/commit`, {
+      method: 'POST',
+      token: memberToken,
+      body: { token: 'imp_not_exists', sheet: 'Sheet1', mapping: { code: 0 }, mode: 'merge' },
+    });
+    check(
+      '非法导入方式先于会话校验(400)',
+      badModeNoSession.status === 400 && /导入方式/.test(badModeNoSession.data?.message || ''),
+      JSON.stringify(badModeNoSession.data),
+    );
+
+    const bypass = await api(`/tables/${isoId}/import/commit`, {
+      method: 'POST',
+      token: memberToken,
+      body: {
+        token: memberPreview.data.token,
+        sheet: memberSheet,
+        mapping: { code: 0, name: 1 },
+        mode: 'upsert',
+        dedupeKey: 'code',
+      },
+    });
+    check(
+      '成员导入不能覆盖他人数据',
+      bypass.ok && bypass.data.updated === 0 && bypass.data.failed === 1,
+      JSON.stringify(bypass.data),
+    );
+    const isoAfter = await api(`/tables/${isoId}/rows?pageSize=50`, { token: adminToken });
+    const isoVictim = isoAfter.data.items.find((r) => r.data.code === 'ADM-1');
+    check('他人数据内容未被改动', isoVictim?.data?.name === '管理员录入', String(isoVictim?.data?.name));
+
+    const adminPreview = await api(`/tables/${isoId}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(isoXlsx, 'perm-admin.xlsx'),
+    });
+    const adminBypass = await api(`/tables/${isoId}/import/commit`, {
+      method: 'POST',
+      token: adminToken,
+      body: {
+        token: adminPreview.data.token,
+        sheet: adminPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'upsert',
+        dedupeKey: 'code',
+      },
+    });
+    check('管理员导入可更新他人的数据', adminBypass.ok && adminBypass.data.updated === 1, JSON.stringify(adminBypass.data));
+    await api(`/tables/${isoId}`, { method: 'DELETE', token: adminToken });
+
+    console.log('\n== 12. 删除表格（级联）==');
     const delTable = await api(`/tables/${tableId}`, { method: 'DELETE', token: adminToken });
     check('管理员删除表格', delTable.ok);
     check('表格已消失', (await api(`/tables/${tableId}`, { token: adminToken })).status === 404);

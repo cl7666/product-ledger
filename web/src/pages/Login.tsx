@@ -149,15 +149,17 @@ export default function Login() {
             </Button>
           </Form>
 
-          <div className="demo-accounts">
-            <div>演示账号（点击填充）：</div>
-            <div>
-              管理员 <code onClick={() => fill('admin', 'admin123')}>admin / admin123</code>
+          {import.meta.env.DEV && (
+            <div className="demo-accounts">
+              <div>演示账号（仅开发模式显示，点击填充）：</div>
+              <div>
+                管理员 <code onClick={() => fill('admin', 'admin123')}>admin / admin123</code>
+              </div>
+              <div>
+                成员 <code onClick={() => fill('zhangsan', 'member123')}>zhangsan / member123</code>
+              </div>
             </div>
-            <div>
-              成员 <code onClick={() => fill('zhangsan', 'member123')}>zhangsan / member123</code>
-            </div>
-          </div>
+          )}
         </div>
       </div>
     </div>
