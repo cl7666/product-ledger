@@ -107,6 +107,10 @@ npm start         # 启动服务，访问 http://127.0.0.1:4399
 
 启动脚本 `scripts/start-app.ps1` 支持 `-Port 5000`（通过 `PORT` 环境变量传给服务端）、`-Rebuild`（强制重建前端）、`-NoBrowser`（不打开浏览器）。实际动作：检查 Node 版本 → 必要时安装依赖 → `web/dist` 缺失或前端源码比构建产物新时自动构建 → 后台运行 `node server/src/index.js`，PID 写入 `logs/server.pid` → 轮询 `/api/health` 直到就绪 → 打开浏览器。服务输出写到 `logs/server.log` 与 `logs/server.err.log`（每次启动前保留一份 `.prev`）。如果端口已被**本系统**占用则跳过启动；被其他程序占用会直接报错，不会把别人的页面当成自己的。
 
+停止脚本 `scripts/stop-app.ps1` 支持 `-Port 5000` 与 `-NonInteractive`。它只停「PID 文件记录且确实在指定端口监听」或「指定端口上确实属于本项目的 node.exe」的进程；PID 文件与 `-Port` 不一致时不会误杀其他实例。`-NonInteractive` 供脚本/计划任务调用，结束时不再等待回车。
+
+> 服务实际由 `scripts/run-server.cmd` 拉起（由 `start-app.ps1` 通过 ShellExecute 启动）。这样常驻的 node 进程不会继承调用方的标准输出句柄，`powershell -File scripts\start-app.ps1 -NoBrowser | Select-Object -Last 5` 这类管道/自动化调用才能在几秒内正常返回。
+
 ## 局域网共享（同一 WiFi 的多台电脑）
 
 可以。这套系统是「一个服务端 + 浏览器客户端」的结构：**所有电脑访问同一台机器的 4399 端口，看到的就是同一份数据**（`server/data/db.json`）。

@@ -147,21 +147,17 @@ $node = (Get-Command node).Source
 # 关键：把端口通过环境变量传给子进程，否则服务端恒监听 4399
 $env:PORT = "$Port"
 
-$proc = Start-Process -FilePath $node `
-  -ArgumentList 'src/index.js' `
-  -WorkingDirectory (Join-Path $root 'server') `
-  -WindowStyle Hidden `
-  -RedirectStandardOutput $outLog `
-  -RedirectStandardError  $errLog `
-  -PassThru
-
-$proc.Id | Set-Content -Path $pidFile -Encoding ASCII
+# 通过 scripts\run-server.cmd（ShellExecute 启动）拉起服务：
+# 不走 -RedirectStandardOutput，避免常驻 node 继承本脚本的输出句柄，
+# 否则脚本被管道 / 计划任务调用时会「服务已启动但调用方一直不返回」。
+$runner = Join-Path $PSScriptRoot 'run-server.cmd'
+Start-Process -FilePath $env:ComSpec -ArgumentList '/c', "`"$runner`"" -WindowStyle Hidden
 
 $ok = $false
 for ($i = 0; $i -lt 60; $i++) {
   Start-Sleep -Milliseconds 500
+  if (-not (Test-PortOpen $Port)) { continue }
   if (Test-ServiceUp $Port) { $ok = $true; break }
-  if ($proc.HasExited) { break }
 }
 
 if (-not $ok) {
@@ -169,10 +165,17 @@ if (-not $ok) {
   if (Test-Path $errLog) { Get-Content $errLog -Tail 20 -Encoding UTF8 }
   if (Test-Path $outLog) { Get-Content $outLog -Tail 20 -Encoding UTF8 }
   # 清理残留进程，避免占用端口
-  if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+  $stale = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($stale) { Stop-Process -Id $stale.OwningProcess -Force -ErrorAction SilentlyContinue }
   Remove-Item -Path $pidFile -ErrorAction SilentlyContinue
   Pause-IfNeeded
   exit 1
+}
+
+# 端口起来了再从监听套接字反查真实 PID，写进 PID 文件供停止脚本使用
+$listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($listener) {
+  $listener.OwningProcess | Set-Content -Path $pidFile -Encoding ASCII
 }
 
 Write-Host ''
