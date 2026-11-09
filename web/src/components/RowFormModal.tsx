@@ -94,7 +94,7 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
               {col.type === 'number' ? (
                 <InputNumber style={{ width: '100%' }} placeholder={`请输入${col.label}`} />
               ) : col.type === 'textarea' ? (
-                <Input.TextArea rows={2} placeholder={`请输入${col.label}`} maxLength={500} />
+                <Input.TextArea rows={2} placeholder={`请输入${col.label}`} maxLength={2000} showCount />
               ) : col.type === 'select' ? (
                 <Select
                   placeholder={`请选择${col.label}`}
@@ -106,7 +106,7 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
               ) : col.type === 'date' ? (
                 <DatePicker style={{ width: '100%' }} placeholder={`请选择${col.label}`} />
               ) : (
-                <Input placeholder={`请输入${col.label}`} maxLength={200} />
+                <Input placeholder={`请输入${col.label}`} maxLength={2000} />
               )}
             </Form.Item>
           ))}

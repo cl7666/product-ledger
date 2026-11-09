@@ -23,7 +23,7 @@ router.get('/', (req, res) => {
   }
 
   const lowStock = db.ledger
-    .filter((l) => Number(l.quantity) <= 10)
+    .filter((l) => Number(l.quantity) >= 0 && Number(l.quantity) <= 10)
     .sort((a, b) => Number(a.quantity) - Number(b.quantity))
     .slice(0, 6)
     .map((l) => ({

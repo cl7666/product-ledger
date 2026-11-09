@@ -5,6 +5,8 @@ import { DATA_DIR, getDb, saveDbSoon, uid, now } from './db.js';
 
 const SECRET_FILE = path.join(DATA_DIR, 'jwt.secret');
 const TOKEN_TTL = '12h';
+/** bcrypt 计算成本：8 偏低，10 在登录体验与抗暴力破解之间更平衡 */
+export const BCRYPT_ROUNDS = 10;
 
 function loadSecret() {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
@@ -18,12 +20,17 @@ function loadSecret() {
 const SECRET = loadSecret();
 
 export function signToken(user) {
-  return jwt.sign({ sub: user.id, role: user.role }, SECRET, { expiresIn: TOKEN_TTL });
+  // ver 与用户表 tokenVersion 绑定：改密/被重置密码后旧令牌立即失效
+  return jwt.sign(
+    { sub: user.id, role: user.role, ver: user.tokenVersion ?? 0 },
+    SECRET,
+    { expiresIn: TOKEN_TTL },
+  );
 }
 
 export function publicUser(user) {
   if (!user) return null;
-  const { passwordHash, ...rest } = user;
+  const { passwordHash, tokenVersion, ...rest } = user;
   return rest;
 }
 
@@ -37,6 +44,10 @@ export function requireAuth(req, res, next) {
     const payload = jwt.verify(token, SECRET);
     const user = getDb().users.find((u) => u.id === payload.sub);
     if (!user) return res.status(401).json({ message: '账号不存在或已被删除' });
+    // 旧数据没有 tokenVersion，按 0 处理；改密后自增即可让所有旧 token 失效
+    if ((payload.ver ?? 0) !== (user.tokenVersion ?? 0)) {
+      return res.status(401).json({ message: '登录状态已失效，请重新登录' });
+    }
     req.user = user;
     next();
   } catch {

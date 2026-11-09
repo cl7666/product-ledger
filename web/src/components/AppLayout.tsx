@@ -34,7 +34,7 @@ import {
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { useAuth } from '../auth';
-import { api } from '../api';
+import { api, tokenStore } from '../api';
 import { fileToAvatar } from '../avatar';
 import { formatDateTime } from '../utils';
 
@@ -92,8 +92,10 @@ export default function AppLayout() {
     try {
       const values = await pwdForm.validateFields();
       setSaving(true);
-      await api.changePassword(values.oldPassword, values.newPassword);
-      message.success('密码已更新，下次登录请使用新密码');
+      const res = await api.changePassword(values.oldPassword, values.newPassword);
+      // 改密后旧 token 已失效，保存服务端补发的新 token，当前会话不被踢下线
+      if (res.token) tokenStore.set(res.token);
+      message.success('密码已更新，其他设备的登录状态已失效');
       setPwdOpen(false);
       pwdForm.resetFields();
     } catch (err) {

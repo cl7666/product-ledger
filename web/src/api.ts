@@ -118,7 +118,9 @@ export const api = {
       .catch(() => undefined);
   },
   changePassword: (oldPassword: string, newPassword: string) =>
-    http.post<{ message: string }>('/auth/password', { oldPassword, newPassword }).then((r) => r.data),
+    http
+      .post<{ message: string; token: string }>('/auth/password', { oldPassword, newPassword })
+      .then((r) => r.data),
   updateProfile: (body: { name?: string; avatar?: string | null }) =>
     http.patch<{ user: User; message: string }>('/auth/profile', body).then((r) => r.data),
 
@@ -157,7 +159,14 @@ export const api = {
       body: { rowIds?: string[]; scope: 'all' | 'selected'; mode: 'upsert' | 'insert'; mapping: Record<string, string> },
     ) =>
       http
-        .post<{ created: number; updated: number; skipped: number; message: string }>(`/tables/${id}/sync-ledger`, body)
+        .post<{
+          created: number;
+          updated: number;
+          skipped: number;
+          errors?: { row: string; code?: string; message: string }[];
+          errorsTruncated?: boolean;
+          message: string;
+        }>(`/tables/${id}/sync-ledger`, body)
         .then((r) => r.data),
     importPreview: (id: string, file: File) => {
       const fd = new FormData();

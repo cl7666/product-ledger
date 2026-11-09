@@ -1,38 +1,53 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import { getDb, saveDbSoon, now } from '../db.js';
-import { requireAuth, signToken, publicUser, logAction } from '../auth.js';
+import { requireAuth, signToken, publicUser, logAction, BCRYPT_ROUNDS } from '../auth.js';
 
 const router = express.Router();
 
-const attempts = new Map(); // username -> { count, until }
+const attempts = new Map(); // `${username}|${ip}` -> { count, until }
 const MAX_ATTEMPTS = 6;
 const WINDOW_MS = 5 * 60 * 1000;
+
+/** 清掉过期记录，避免长期运行后 Map 只增不减 */
+function pruneAttempts() {
+  const ts = Date.now();
+  for (const [key, record] of attempts) {
+    if (record.until < ts) attempts.delete(key);
+  }
+  while (attempts.size > 2000) {
+    const first = attempts.keys().next().value;
+    attempts.delete(first);
+  }
+}
 
 router.post('/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ message: '请输入用户名和密码' });
   }
-  const key = String(username).toLowerCase();
-  const record = attempts.get(key);
+  pruneAttempts();
+  const usernameKey = String(username).trim().toLowerCase();
+  // 用户名 + 来源 IP 作为锁定键：别人无法通过刷错密码把某个账号整体锁死
+  const attemptKey = `${usernameKey}|${req.ip || req.socket?.remoteAddress || ''}`;
+  const record = attempts.get(attemptKey);
   if (record && record.count >= MAX_ATTEMPTS && Date.now() < record.until) {
     const wait = Math.ceil((record.until - Date.now()) / 1000);
     return res.status(429).json({ message: `密码错误次数过多，请 ${wait} 秒后重试` });
   }
 
   const db = getDb();
-  const user = db.users.find((u) => u.username.toLowerCase() === key);
+  const user = db.users.find((u) => u.username.toLowerCase() === usernameKey);
   const ok = user && bcrypt.compareSync(String(password), user.passwordHash);
   if (!ok) {
     const next = record && Date.now() < record.until ? record : { count: 0, until: 0 };
     next.count += 1;
     next.until = Date.now() + WINDOW_MS;
-    attempts.set(key, next);
+    attempts.set(attemptKey, next);
     return res.status(401).json({ message: '用户名或密码错误' });
   }
 
-  attempts.delete(key);
+  attempts.delete(attemptKey);
   user.lastLoginAt = now();
   saveDbSoon();
   logAction(user, '登录系统', '登录', `${user.role === 'admin' ? '管理员' : '成员'}登录成功`);
@@ -54,11 +69,13 @@ router.post('/password', requireAuth, (req, res) => {
   if (!bcrypt.compareSync(String(oldPassword), req.user.passwordHash)) {
     return res.status(400).json({ message: '原密码不正确' });
   }
-  req.user.passwordHash = bcrypt.hashSync(String(newPassword), 8);
+  req.user.passwordHash = bcrypt.hashSync(String(newPassword), BCRYPT_ROUNDS);
+  req.user.tokenVersion = (req.user.tokenVersion ?? 0) + 1;
   req.user.updatedAt = now();
   saveDbSoon();
   logAction(req.user, '修改密码', '个人中心', '');
-  res.json({ message: '密码已更新' });
+  // 旧 token 全部失效；给当前会话补发一个新 token，避免刚改完密码就被踢下线
+  res.json({ message: '密码已更新', token: signToken(req.user) });
 });
 
 router.post('/logout', requireAuth, (req, res) => {

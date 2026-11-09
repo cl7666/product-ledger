@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import { HttpError } from './http.js';
 
 const BRAND = 'FF1F3A5F';
 const BRAND_LIGHT = 'FFEAF1F8';
@@ -16,8 +17,10 @@ function thinBorder() {
 function cellText(value) {
   if (value === null || value === undefined) return '';
   if (value instanceof Date) {
-    const d = new Date(value.getTime() + 8 * 3600 * 1000);
-    return d.toISOString().slice(0, 10);
+    // Excel 日期是"无时区"的序列值，ExcelJS 按 UTC 还原；这里也按 UTC 取日期，
+    // 不再硬编码 +8 小时，避免跨时区部署时日期前后偏移一天。
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
   }
   if (typeof value === 'object') {
     if (Array.isArray(value.richText)) return value.richText.map((t) => t.text).join('');
@@ -33,7 +36,12 @@ function cellText(value) {
 /** 解析上传的 Excel，返回 [{ name, headers, rows: string[][] }] */
 export async function parseWorkbook(buffer, { maxRows = 5000 } = {}) {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
+  try {
+    await wb.xlsx.load(buffer);
+  } catch {
+    // 损坏 / 伪造的 .xlsx 属于客户端输入问题，返回 400，不把底层异常抛给全局 500
+    throw new HttpError(400, 'Excel 文件无法解析，请确认是有效的 .xlsx 文件');
+  }
   const sheets = [];
   wb.eachSheet((ws) => {
     const matrix = [];
@@ -116,7 +124,6 @@ export async function buildWorkbook({
 
   // 表头
   const headerRow = ws.getRow(3);
-  const letters = [];
   for (let i = 0; i < colCount; i += 1) {
     const col = columns[i];
     const cell = headerRow.getCell(i + 1);
@@ -125,8 +132,12 @@ export async function buildWorkbook({
     cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND } };
     cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     cell.border = thinBorder();
-    ws.getColumn(i + 1).width = col.width || Math.max(10, Math.min(30, String(col.label).length * 2.4 + 6));
-    letters.push(String.fromCharCode(65 + (i % 26)));
+    // 兼容两种宽度来源：台账字段传的是 Excel 字符宽度（8-26）；
+    // 自定义表格传的是前端 UI 像素宽度（80-480），>60 视为像素并换算成字符宽度
+    const rawWidth = col.width || Math.max(10, Math.min(30, String(col.label).length * 2.4 + 6));
+    ws.getColumn(i + 1).width = rawWidth > 60
+      ? Math.min(Math.max(Math.round((rawWidth - 5) / 7), 8), 60)
+      : rawWidth;
   }
   headerRow.height = 26;
 
@@ -147,7 +158,8 @@ export async function buildWorkbook({
       } else {
         cell.value = value ?? '';
         cell.alignment = {
-          horizontal: ['状态', '单位', '分类', '仓库'].includes(col.label) ? 'center' : 'left',
+          // 下拉列与短枚举类文本居中，其余左对齐
+          horizontal: col.type === 'select' || ['状态', '单位', '分类', '仓库'].includes(col.label) ? 'center' : 'left',
           vertical: 'middle',
           wrapText: col.type === 'textarea' || col.label === '备注',
         };

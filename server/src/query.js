@@ -1,14 +1,28 @@
 /** 通用筛选 / 排序 / 分页工具（表格数据与台账共用） */
+import { HttpError } from './http.js';
 
+const FILTER_OPS = new Set([
+  'eq', 'neq', 'contains', 'notcontains', 'gt', 'gte', 'lt', 'lte',
+  'empty', 'notempty', 'between', 'in',
+]);
+
+/** 非法筛选参数明确报 400，避免静默返回全量数据让用户误以为筛选生效 */
 export function parseFilters(raw) {
   if (!raw) return [];
+  let arr;
   try {
-    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!Array.isArray(arr)) return [];
-    return arr.filter((f) => f && typeof f.field === 'string' && f.field);
+    arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
   } catch {
-    return [];
+    throw new HttpError(400, '筛选条件不是合法的 JSON');
   }
+  if (!Array.isArray(arr)) throw new HttpError(400, '筛选条件必须是数组');
+  return arr
+    .filter((f) => f && typeof f.field === 'string' && f.field)
+    .map((f) => {
+      const op = f.op || 'contains';
+      if (!FILTER_OPS.has(op)) throw new HttpError(400, `不支持的筛选运算符：${op}`);
+      return { ...f, op };
+    });
 }
 
 function asString(v) {

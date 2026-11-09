@@ -102,8 +102,12 @@ app.use((err, req, res, next) => {
     return res.status(413).json({ message: '文件不能超过 20MB' });
   }
   const status = err.status || 500;
-  if (status >= 500) console.error('[error]', err);
-  res.status(status).json({ message: err.message || '服务器内部错误' });
+  if (status >= 500) {
+    // 5xx 只写日志，不把内部异常细节返回给客户端
+    console.error('[error]', err);
+    return res.status(500).json({ message: '服务器内部错误' });
+  }
+  res.status(status).json({ message: err.message || '请求失败' });
 });
 
 /** 列出本机局域网 IPv4，供控制台提示"其他电脑怎么连" */

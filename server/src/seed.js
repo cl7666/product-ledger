@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { getDb, saveDb, resetDb, uid } from './db.js';
 import { ledgerAmount } from './ledger-fields.js';
 import { toDateOnly } from './store.js';
+import { BCRYPT_ROUNDS } from './auth.js';
 
 const day = 24 * 3600 * 1000;
 const ago = (n, hour = 9) => {
@@ -37,8 +38,9 @@ export function seed() {
     id: uid('u_'),
     username: 'admin',
     name: '系统管理员',
-    passwordHash: bcrypt.hashSync('admin123', 8),
+    passwordHash: bcrypt.hashSync('admin123', BCRYPT_ROUNDS),
     role: 'admin',
+    tokenVersion: 0,
     createdAt: ago(30),
     updatedAt: ago(30),
     lastLoginAt: ago(0, 8),
@@ -47,8 +49,9 @@ export function seed() {
     id: uid('u_'),
     username: 'zhangsan',
     name: '张三',
-    passwordHash: bcrypt.hashSync('member123', 8),
+    passwordHash: bcrypt.hashSync('member123', BCRYPT_ROUNDS),
     role: 'member',
+    tokenVersion: 0,
     createdAt: ago(21),
     updatedAt: ago(21),
     lastLoginAt: ago(1, 16),
@@ -57,8 +60,9 @@ export function seed() {
     id: uid('u_'),
     username: 'lisi',
     name: '李四',
-    passwordHash: bcrypt.hashSync('member123', 8),
+    passwordHash: bcrypt.hashSync('member123', BCRYPT_ROUNDS),
     role: 'member',
+    tokenVersion: 0,
     createdAt: ago(14),
     updatedAt: ago(14),
     lastLoginAt: null,

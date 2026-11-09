@@ -4,7 +4,7 @@ import { getDb, saveDbSoon, uid, now } from '../db.js';
 import { requireAuth, logAction } from '../auth.js';
 import { buildWorkbook, parseWorkbook } from '../excel.js';
 import { putSession, getSession } from '../import-sessions.js';
-import { LEDGER_FIELDS, ledgerAmount } from '../ledger-fields.js';
+import { LEDGER_FIELDS } from '../ledger-fields.js';
 import {
   listTables,
   findTableOr404,
@@ -13,8 +13,10 @@ import {
   createTable,
   deleteTableRows,
   normalizeRowData,
+  normalizeRowPatch,
   validateRow,
 } from '../store.js';
+import { canEditLedger, readLedgerPayload, validateLedgerEntry } from '../ledger-service.js';
 import { applyFilters, matchesKeyword, paginate, parseFilters, sortRows } from '../query.js';
 import { COLUMN_TYPES } from '../ledger-fields.js';
 import { HttpError, asyncHandler, setDownloadHeaders, stamp } from '../http.js';
@@ -113,6 +115,7 @@ router.patch('/:id', (req, res) => {
   if (name !== undefined) {
     const next = String(name).trim();
     if (!next) throw new HttpError(400, '表格名称不能为空');
+    if (next.length > 30) throw new HttpError(400, '表格名称最多 30 字');
     if (getDb().tables.some((t) => t.id !== table.id && t.name === next)) {
       throw new HttpError(400, '已存在同名表格');
     }
@@ -157,7 +160,10 @@ function collectRows(table, query) {
   let rows = getDb().rows.filter((r) => r.tableId === table.id);
   if (keyword) rows = rows.filter((r) => matchesKeyword(r.data, keyword, keys));
   rows = applyFilters(rows, filters, (row, field) => row.data[field]);
-  return sortRows(rows, query.sortBy, query.sortOrder, (row, field) => {
+  // 排序字段白名单：只允许本表字段与两个时间戳，非法字段忽略（保持默认顺序）
+  const sortable = new Set([...keys, '_createdAt', '_updatedAt']);
+  const sortBy = sortable.has(String(query.sortBy || '')) ? query.sortBy : undefined;
+  return sortRows(rows, sortBy, query.sortOrder, (row, field) => {
     if (field === '_createdAt') return row.createdAt;
     if (field === '_updatedAt') return row.updatedAt;
     return row.data[field];
@@ -341,14 +347,20 @@ router.post('/:id/import/commit', (req, res) => {
     }
   }
 
+  const MAX_ERROR_ROWS = 30;
   let inserted = 0;
   let updated = 0;
+  let failed = 0;
   const errors = [];
+  const fail = (row, message) => {
+    failed += 1;
+    if (errors.length < MAX_ERROR_ROWS) errors.push({ row, message });
+  };
+
   source.rows.forEach((cells, index) => {
     if (!cells.some((c) => String(c ?? '').trim() !== '')) return;
     const input = {};
     for (const [colKey, idx] of pairs) input[colKey] = cells[idx] ?? '';
-    const data = normalizeRowData(table, input);
     // 数字列：Excel 里填了非数字内容时明确报错，避免静默丢数据
     const badNumber = pairs.find(([colKey, idx]) => {
       const col = table.columns.find((c) => c.key === colKey);
@@ -357,39 +369,44 @@ router.post('/:id/import/commit', (req, res) => {
     });
     if (badNumber) {
       const col = table.columns.find((c) => c.key === badNumber[0]);
-      if (errors.length < 30) {
-        errors.push({ row: index + 2, message: `「${col.label}」不是有效数字：${cells[badNumber[1]]}` });
-      }
-      return;
-    }
-    const rowErrors = validateRow(table, data);
-    if (rowErrors.length) {
-      if (errors.length < 30) errors.push({ row: index + 2, message: rowErrors.join('；') });
+      fail(index + 2, `「${col.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     if (mode === 'upsert' && dedupeKey) {
-      const key = String(data[dedupeKey] ?? '').trim().toLowerCase();
+      // 用规范化后的值做匹配键，与库中已有数据的存储格式保持一致
+      const normalizedKey = normalizeRowPatch(table, { [dedupeKey]: input[dedupeKey] })[dedupeKey];
+      const key = String(normalizedKey ?? '').trim().toLowerCase();
       if (!key) {
-        if (errors.length < 30) {
-          errors.push({ row: index + 2, message: `「${dedupeLabel}」为空，无法判断是否与已有数据重复` });
-        }
+        fail(index + 2, `「${dedupeLabel}」为空，无法判断是否与已有数据重复`);
         return;
       }
       if (existing.has(key)) {
         const target = existing.get(key);
         // 行级权限：与单条 PATCH 保持一致，导入也不能覆盖别人录入的数据
         if (!canEditRow(req.user, table, target)) {
-          if (errors.length < 30) {
-            errors.push({ row: index + 2, message: '无权覆盖他人录入的数据，可联系表格创建者或管理员处理' });
-          }
+          fail(index + 2, '无权覆盖他人录入的数据，可联系表格创建者或管理员处理');
           return;
         }
-        target.data = { ...target.data, ...data };
+        // 只合并"本次实际映射的列"：未映射列保持原值，不能被空串/null 覆盖
+        const patch = normalizeRowPatch(table, input);
+        const merged = { ...target.data, ...patch };
+        const mergedErrors = validateRow(table, merged);
+        if (mergedErrors.length) {
+          fail(index + 2, mergedErrors.join('；'));
+          return;
+        }
+        target.data = merged;
         target.updatedAt = now();
         target.updatedBy = req.user.id;
         updated += 1;
         return;
       }
+    }
+    const data = normalizeRowData(table, input);
+    const rowErrors = validateRow(table, data);
+    if (rowErrors.length) {
+      fail(index + 2, rowErrors.join('；'));
+      return;
     }
     const row = {
       id: uid('r_'),
@@ -410,14 +427,15 @@ router.post('/:id/import/commit', (req, res) => {
 
   table.updatedAt = now();
   saveDbSoon();
-  logAction(req.user, '导入 Excel', table.name, `新增 ${inserted} 条，更新 ${updated} 条，失败 ${errors.length} 条`);
+  logAction(req.user, '导入 Excel', table.name, `新增 ${inserted} 条，更新 ${updated} 条，失败 ${failed} 条`);
   res.json({
     inserted,
     updated,
-    failed: errors.length,
+    failed,
     total: source.rows.length,
     errors,
-    message: `导入完成：新增 ${inserted} 条${updated ? `，更新 ${updated} 条` : ''}${errors.length ? `，${errors.length} 条校验失败` : ''}`,
+    errorsTruncated: failed > errors.length,
+    message: `导入完成：新增 ${inserted} 条${updated ? `，更新 ${updated} 条` : ''}${failed ? `，${failed} 条校验失败` : ''}`,
   });
 });
 
@@ -429,9 +447,23 @@ router.get(
     const table = findTableOr404(req, res);
     if (!table) return;
     const rows = collectRows(table, req.query);
+    // 数字列按实际数据决定小数位：整型数据用 #,##0，出现小数才用 #,##0.00
+    const precisionByKey = {};
+    for (const c of table.columns.filter((x) => x.type === 'number')) {
+      const vals = rows
+        .map((r) => r.data[c.key])
+        .filter((v) => typeof v === 'number' && Number.isFinite(v));
+      precisionByKey[c.key] = vals.length > 0 && vals.every((v) => Number.isInteger(v)) ? 0 : 2;
+    }
     const columns = [
       { key: '__index', label: '序号', type: 'text', width: 8 },
-      ...table.columns.map((c) => ({ key: c.key, label: c.label, type: c.type, width: c.width })),
+      ...table.columns.map((c) => ({
+        key: c.key,
+        label: c.label,
+        type: c.type,
+        width: c.width,
+        ...(c.type === 'number' ? { precision: precisionByKey[c.key] ?? 2 } : {}),
+      })),
       { key: '__updatedAt', label: '更新时间', type: 'date', width: 20 },
     ];
     const data = rows.map((r, i) => ({
@@ -458,7 +490,12 @@ router.get(
 router.post('/:id/sync-ledger', (req, res) => {
   const table = findTableOr404(req, res);
   if (!table) return;
-  const { rowIds, mapping, mode = 'upsert', scope = 'selected' } = req.body || {};
+  const { rowIds, mapping, scope = 'selected' } = req.body || {};
+  // mode 白名单：此前任何非 upsert 的值都会走"直接新增"，可以绕过编号唯一
+  const mode = String(req.body?.mode ?? 'upsert').trim().toLowerCase();
+  if (!['upsert', 'insert'].includes(mode)) {
+    throw new HttpError(400, '同步方式只能是 upsert（按编号更新）或 insert（总是新增）');
+  }
   const db = getDb();
 
   let rows = db.rows.filter((r) => r.tableId === table.id);
@@ -481,68 +518,107 @@ router.post('/:id/sync-ledger', (req, res) => {
 
   let created = 0;
   let updated = 0;
+  let skippedCount = 0;
   const skipped = [];
+  const skip = (row, code, message) => {
+    skippedCount += 1;
+    if (skipped.length < 30) skipped.push({ row: row.id, code, message });
+  };
+
   for (const row of rows) {
-    const payload = {};
-    for (const [ledgerKey, colKey] of pairs) payload[ledgerKey] = row.data[colKey];
+    const input = {};
+    for (const [ledgerKey, colKey] of pairs) input[ledgerKey] = row.data[colKey];
+    let payload;
+    try {
+      // 与单条台账写入共用严格解析：非法数字不再静默变成 0。
+      // 空单元格跳过解析（不写入 payload）：更新已有台账时表示"该字段不修改"，
+      // 避免把别人的单价/备注清成 0 / 空串；新增记录的默认值在下方 entry 构造时兜底
+      payload = readLedgerPayload(input, { skipEmpty: true });
+    } catch (err) {
+      skip(row, String(input.code ?? ''), err.message);
+      continue;
+    }
     const code = String(payload.code ?? '').trim();
     const name = String(payload.name ?? '').trim();
     if (!code && !name) {
-      skipped.push(row.id);
+      skip(row, '', '产品编号与产品名称均为空');
       continue;
     }
-    const price = payload.price === undefined ? undefined : Number(payload.price) || 0;
-    const quantity = payload.quantity === undefined ? undefined : Number(payload.quantity) || 0;
-    const patch = {
-      ...(code ? { code } : {}),
-      ...(name ? { name } : {}),
-      ...(payload.spec !== undefined ? { spec: String(payload.spec) } : {}),
-      ...(payload.category !== undefined ? { category: String(payload.category) } : {}),
-      ...(payload.unit !== undefined ? { unit: String(payload.unit) } : {}),
-      ...(price !== undefined ? { price } : {}),
-      ...(quantity !== undefined ? { quantity } : {}),
-      ...(payload.warehouse !== undefined ? { warehouse: String(payload.warehouse) } : {}),
-      ...(payload.supplier !== undefined ? { supplier: String(payload.supplier) } : {}),
-      ...(payload.status !== undefined ? { status: String(payload.status) } : {}),
-      ...(payload.remark !== undefined ? { remark: String(payload.remark) } : {}),
-    };
+    // 按编号更新但没有编号：与台账 Excel 导入保持一致，按行跳过而不是生成 AUTO 编号
+    if (mode === 'upsert' && !code) {
+      skip(row, '', '产品编号为空，无法按编号匹配更新');
+      continue;
+    }
     let target = null;
     if (mode === 'upsert' && code) {
       target = db.ledger.find((l) => String(l.code).toLowerCase() === code.toLowerCase());
     }
     if (target) {
-      Object.assign(target, patch, { updatedAt: now(), updatedBy: req.user.id });
+      // 与单条 PATCH / Excel 导入同一规则：成员不能覆盖他人录入的台账
+      if (!canEditLedger(req.user, target)) {
+        skip(row, code, '无权覆盖他人录入的台账，可联系管理员处理');
+        continue;
+      }
+      try {
+        validateLedgerEntry({ ...target, ...payload });
+      } catch (err) {
+        skip(row, code, err.message);
+        continue;
+      }
+      Object.assign(target, payload, { updatedAt: now(), updatedBy: req.user.id });
       updated += 1;
-    } else {
-      db.ledger.push({
-        id: uid('lg_'),
-        code: patch.code || `AUTO-${uid('').slice(-6)}`,
-        name: patch.name || '未命名产品',
-        spec: patch.spec || '',
-        category: patch.category || '',
-        unit: patch.unit || '',
-        price: price ?? 0,
-        quantity: quantity ?? 0,
-        warehouse: patch.warehouse || '',
-        supplier: patch.supplier || '',
-        status: patch.status || '在库',
-        remark: patch.remark || '',
-        sourceTable: table.name,
-        createdAt: now(),
-        updatedAt: now(),
-        createdBy: req.user.id,
-        updatedBy: req.user.id,
-      });
-      created += 1;
+      continue;
     }
+    // 新增分支同样要守住"产品编号唯一"：insert 模式也允许按编号更新之外的场景，
+    // 但不能凭空制造两条同编号台账
+    if (code && db.ledger.some((l) => String(l.code).toLowerCase() === code.toLowerCase())) {
+      skip(row, code, '台账中已存在相同产品编号，请改用「按编号更新」或修改编号');
+      continue;
+    }
+    const entry = {
+      id: uid('lg_'),
+      code: code || `AUTO-${uid('').slice(-6)}`,
+      name: name || '未命名产品',
+      spec: payload.spec || '',
+      category: payload.category || '',
+      unit: payload.unit || '',
+      price: payload.price ?? 0,
+      quantity: payload.quantity ?? 0,
+      warehouse: payload.warehouse || '',
+      supplier: payload.supplier || '',
+      status: payload.status || '在库',
+      remark: payload.remark || '',
+      sourceTable: table.name,
+      createdAt: now(),
+      updatedAt: now(),
+      createdBy: req.user.id,
+      updatedBy: req.user.id,
+    };
+    try {
+      validateLedgerEntry(entry);
+    } catch (err) {
+      skip(row, code, err.message);
+      continue;
+    }
+    db.ledger.push(entry);
+    created += 1;
   }
   saveDbSoon();
-  logAction(req.user, '同步到台账', table.name, `新增 ${created} 条，更新 ${updated} 条`);
+  logAction(
+    req.user,
+    '同步到台账',
+    table.name,
+    `新增 ${created} 条，更新 ${updated} 条，跳过 ${skippedCount} 条`,
+  );
   res.json({
     created,
     updated,
-    skipped: skipped.length,
-    message: `已同步台账：新增 ${created} 条，更新 ${updated} 条`,
+    skipped: skippedCount,
+    errors: skipped,
+    errorsTruncated: skippedCount > skipped.length,
+    message: `已同步台账：新增 ${created} 条，更新 ${updated} 条${
+      skippedCount ? `，跳过 ${skippedCount} 条（编号重复 / 无权限 / 数据非法）` : ''
+    }`,
   });
 });
 

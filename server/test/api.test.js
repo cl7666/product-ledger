@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
+import { parseWorkbook } from '../src/excel.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -101,7 +102,7 @@ async function main() {
 
     const memberLogin = await api('/auth/login', { method: 'POST', body: { username: 'zhangsan', password: 'member123' } });
     check('成员登录', memberLogin.ok && memberLogin.data.user.role === 'member');
-    const memberToken = memberLogin.data.token;
+    let memberToken = memberLogin.data.token;
 
     const me = await api('/auth/me', { token: memberToken });
     check('获取当前用户', me.data.user.username === 'zhangsan');
@@ -214,6 +215,15 @@ async function main() {
     check('导出表头正确', String(exportWs.getCell('B3').value).includes('产品编号'));
     check('导出数据行正确', String(exportWs.getCell('C4').value).includes('测试物料'));
     check('导出含总计行', String(exportWs.getCell('A5').value).includes('合计'));
+    // 样式：默认列宽 140px 应换算为 19 个 Excel 字符单位（此前直接写 140 导致列宽巨大）
+    check(
+      '导出列宽按像素换算(140px→19)',
+      exportWs.getColumn(2).width === 19,
+      String(exportWs.getColumn(2).width),
+    );
+    check('导出整数列数字格式无小数位', exportWs.getCell('D4').numFmt === '#,##0', String(exportWs.getCell('D4').numFmt));
+    check('导出下拉列居中', exportWs.getCell('E4').alignment?.horizontal === 'center',
+      JSON.stringify(exportWs.getCell('E4').alignment));
 
     const ledgerExport = await api('/ledger/export', { token: adminToken, raw: true });
     const ledgerBuf = Buffer.from(await ledgerExport.arrayBuffer());
@@ -363,10 +373,14 @@ async function main() {
     check('不能删除自己', (await api(`/users/${adminLogin.data.user.id}`, { method: 'DELETE', token: adminToken })).status === 400);
 
     console.log('\n== 9. 改密码 / 统计 ==');
+    const oldMemberToken = memberToken;
     const pwd = await api('/auth/password', {
       method: 'POST', token: memberToken, body: { oldPassword: 'member123', newPassword: 'newpass123' },
     });
-    check('修改密码', pwd.ok);
+    check('修改密码', pwd.ok && Boolean(pwd.data.token), JSON.stringify(pwd.data));
+    memberToken = pwd.data.token || memberToken;
+    check('改密后旧 token 失效(401)', (await api('/auth/me', { token: oldMemberToken })).status === 401);
+    check('改密接口补发的新 token 可用', (await api('/auth/me', { token: memberToken })).ok);
     check('新密码可登录', (await api('/auth/login', { method: 'POST', body: { username: 'zhangsan', password: 'newpass123' } })).ok);
     check('旧密码失效', (await api('/auth/login', { method: 'POST', body: { username: 'zhangsan', password: 'member123' } })).status === 401);
 
@@ -754,6 +768,496 @@ async function main() {
     void allRows;
     const remaining = await api(`/tables/${tableId}/rows`, { token: adminToken });
     check('级联删除数据', remaining.status === 404);
+
+    console.log('\n== 16. 缺陷修复回归（review-2026-11-09）==');
+
+    // 16.1 表格 upsert 只更新映射列，未映射列必须保留
+    const patchTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-局部映射表',
+        columns: [
+          { label: '编号', key: 'code', type: 'text', required: true },
+          { label: '名称', key: 'name', type: 'text', required: true },
+          { label: '等级', key: 'level', type: 'text' },
+          { label: '数量', key: 'qty', type: 'number' },
+          { label: '备注', key: 'note', type: 'textarea' },
+        ],
+      },
+    });
+    const patchTableId = patchTable.data.table.id;
+    await api(`/tables/${patchTableId}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { code: 'U-1', name: '原始名称', level: 'A', qty: 9, note: '重要备注' },
+    });
+    const patchXlsx = await makeXlsx([['编号', '名称'], ['U-1', '更新后名称']]);
+    const patchPreview = await api(`/tables/${patchTableId}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(patchXlsx, 'patch.xlsx'),
+    });
+    const patchCommit = await api(`/tables/${patchTableId}/import/commit`, {
+      method: 'POST', token: adminToken,
+      body: {
+        token: patchPreview.data.token,
+        sheet: patchPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'upsert',
+        dedupeKey: 'code',
+      },
+    });
+    const patchedRow = (await api(`/tables/${patchTableId}/rows?pageSize=50`, { token: adminToken }))
+      .data.items.find((r) => r.data.code === 'U-1');
+    check(
+      'upsert 未映射列保持原值',
+      patchCommit.data.updated === 1
+        && patchedRow?.data.level === 'A'
+        && patchedRow?.data.qty === 9
+        && patchedRow?.data.note === '重要备注',
+      JSON.stringify(patchedRow?.data),
+    );
+
+    // 16.2 sync-ledger 不能覆盖他人台账
+    await api('/ledger', {
+      method: 'POST', token: adminToken, body: { code: 'REG-SYNC-1', name: '管理员台账', price: 10, quantity: 2 },
+    });
+    const syncTable = await api('/tables', {
+      method: 'POST', token: memberToken,
+      body: {
+        name: '回归-同步权限表',
+        columns: [
+          { label: '编号', key: 'code', type: 'text' },
+          { label: '名称', key: 'name', type: 'text' },
+        ],
+      },
+    });
+    const syncTableId = syncTable.data.table.id;
+    await api(`/tables/${syncTableId}/rows`, {
+      method: 'POST', token: memberToken, body: { code: 'REG-SYNC-1', name: '成员覆盖名称' },
+    });
+    const denySync = await api(`/tables/${syncTableId}/sync-ledger`, {
+      method: 'POST', token: memberToken,
+      body: { scope: 'all', mode: 'upsert', mapping: { code: 'code', name: 'name' } },
+    });
+    check(
+      '成员同步不能覆盖他人台账',
+      denySync.ok && denySync.data.updated === 0 && denySync.data.skipped === 1,
+      JSON.stringify(denySync.data),
+    );
+    const syncedLedger = await api('/ledger?keyword=REG-SYNC-1&pageSize=50', { token: adminToken });
+    check('他人台账内容未被同步改动', syncedLedger.data.items[0]?.name === '管理员台账', syncedLedger.data.items[0]?.name);
+
+    // 16.3 insert 模式也不能制造重复编号
+    const insertDup = await api(`/tables/${syncTableId}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'all', mode: 'insert', mapping: { code: 'code', name: 'name' } },
+    });
+    check(
+      'insert 模式重复编号被跳过',
+      insertDup.ok && insertDup.data.created === 0 && insertDup.data.skipped === 1,
+      JSON.stringify(insertDup.data),
+    );
+    const syncCount = await api('/ledger?keyword=REG-SYNC-1&pageSize=50', { token: adminToken });
+    check(
+      '台账中同编号仍只有 1 条',
+      syncCount.data.items.filter((x) => x.code === 'REG-SYNC-1').length === 1,
+      String(syncCount.data.items.length),
+    );
+
+    // 16.4 sync-ledger 非法 mode
+    check(
+      'sync-ledger 非法 mode 被拒绝(400)',
+      (await api(`/tables/${syncTableId}/sync-ledger`, {
+        method: 'POST', token: adminToken,
+        body: { scope: 'all', mode: 'merge', mapping: { code: 'code' } },
+      })).status === 400,
+    );
+
+    // 16.5 sync-ledger 非法数字不再静默写 0
+    const syncNumTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-同步数字表',
+        columns: [
+          { label: '编号', key: 'code', type: 'text' },
+          { label: '单价', key: 'price', type: 'text' },
+        ],
+      },
+    });
+    await api(`/tables/${syncNumTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken, body: { code: 'REG-SYNC-NUM', price: 'abc' },
+    });
+    const syncNum = await api(`/tables/${syncNumTable.data.table.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'all', mode: 'upsert', mapping: { code: 'code', price: 'price' } },
+    });
+    const syncNumLedger = await api('/ledger?keyword=REG-SYNC-NUM', { token: adminToken });
+    check(
+      '同步非法数字被跳过且不写 0',
+      syncNum.ok && syncNum.data.created === 0 && syncNum.data.skipped === 1 && syncNumLedger.data.items.length === 0,
+      JSON.stringify(syncNum.data),
+    );
+
+    // 16.5b sync-ledger 按编号更新时，空编号行按行跳过而不是生成 AUTO 编号
+    const noCodeTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-同步空编号表',
+        columns: [
+          { label: '编号', key: 'code', type: 'text' },
+          { label: '名称', key: 'name', type: 'text' },
+        ],
+      },
+    });
+    await api(`/tables/${noCodeTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken, body: { code: '', name: '无编号行' },
+    });
+    const noCodeSync = await api(`/tables/${noCodeTable.data.table.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'all', mode: 'upsert', mapping: { code: 'code', name: 'name' } },
+    });
+    check(
+      '同步按编号更新时空编号行被跳过',
+      noCodeSync.ok && noCodeSync.data.created === 0 && noCodeSync.data.skipped === 1,
+      JSON.stringify(noCodeSync.data),
+    );
+
+    // 16.6 台账 PATCH 不能清空必填 / 写入非法枚举与负数
+    const patchLedger = await api('/ledger', {
+      method: 'POST', token: adminToken,
+      body: { code: 'REG-PATCH-1', name: '待修改台账', price: 5, quantity: 2 },
+    });
+    const patchLedgerId = patchLedger.data.item.id;
+    check(
+      '台账编号不能被清空(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { code: '' } })).status === 400,
+    );
+    check(
+      '台账名称不能被清空(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { name: '' } })).status === 400,
+    );
+    check(
+      '台账状态必须为枚举值(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { status: '瞎写' } })).status === 400,
+    );
+    check(
+      '台账单价不能为负(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { price: -1 } })).status === 400,
+    );
+    check(
+      '库存数量必须为整数(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { quantity: 1.5 } })).status === 400,
+    );
+    check(
+      '库存数量不能为负(400)',
+      (await api(`/ledger/${patchLedgerId}`, { method: 'PATCH', token: adminToken, body: { quantity: -1 } })).status === 400,
+    );
+
+    // 16.7 删除用户时台账随表格/数据一起转交
+    const transferUser = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'regtransfer', name: '转交测试', password: 'test123456', role: 'member' },
+    });
+    const transferToken = (await api('/auth/login', {
+      method: 'POST', body: { username: 'regtransfer', password: 'test123456' },
+    })).data.token;
+    await api('/ledger', {
+      method: 'POST', token: transferToken, body: { code: 'REG-DEL-1', name: '被删用户的台账' },
+    });
+    const transferDel = await api(`/users/${transferUser.data.user.id}`, { method: 'DELETE', token: adminToken });
+    const transferred = await api('/ledger?keyword=REG-DEL-1', { token: adminToken });
+    check(
+      '删除用户后台账归属管理员',
+      transferDel.data.transferredLedger === 1
+        && transferred.data.items[0]?.createdBy === adminLogin.data.user.id
+        && transferred.data.items[0]?.createdByName === '系统管理员'
+        && transferred.data.items[0]?.canEdit === true,
+      JSON.stringify({ del: transferDel.data, item: transferred.data.items[0] }),
+    );
+
+    // 16.8 改密后旧 token 失效，新 token 可用
+    const tokenUser = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'regtoken', name: '令牌测试', password: 'token123456', role: 'member' },
+    });
+    const t1 = (await api('/auth/login', {
+      method: 'POST', body: { username: 'regtoken', password: 'token123456' },
+    })).data.token;
+    const tokenPwd = await api('/auth/password', {
+      method: 'POST', token: t1, body: { oldPassword: 'token123456', newPassword: 'token654321' },
+    });
+    const t2 = tokenPwd.data.token;
+    check('改密返回新 token', tokenPwd.ok && Boolean(t2));
+    check('旧 token 改密后失效(401)', (await api('/auth/me', { token: t1 })).status === 401);
+    check('新 token 可继续访问', t2 ? (await api('/auth/me', { token: t2 })).ok : false);
+    check('被重置密码的用户仍能登录', (await api('/auth/login', {
+      method: 'POST', body: { username: 'regtoken', password: 'token654321' },
+    })).ok);
+
+    // 16.8b 管理员重置密码后，被重置用户已登录的会话立即失效
+    const resetUser = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'regreset', name: '重置测试', password: 'reset123456', role: 'member' },
+    });
+    const resetToken = (await api('/auth/login', {
+      method: 'POST', body: { username: 'regreset', password: 'reset123456' },
+    })).data.token;
+    check(
+      '管理员重置密码成功',
+      (await api(`/users/${resetUser.data.user.id}`, {
+        method: 'PATCH', token: adminToken, body: { password: 'reset654321' },
+      })).ok,
+    );
+    check('被重置用户的旧 token 失效(401)', (await api('/auth/me', { token: resetToken })).status === 401);
+    check('被重置用户可用新密码登录', (await api('/auth/login', {
+      method: 'POST', body: { username: 'regreset', password: 'reset654321' },
+    })).ok);
+
+    // 16.9 伪造 xlsx 返回 400 而不是 500
+    const badFile = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(Buffer.from('not an excel'), 'fake.xlsx'),
+    });
+    check('伪造 xlsx 返回 400', badFile.status === 400, `${badFile.status} ${badFile.data?.message || ''}`);
+
+    // 16.10 失败行数不再被 30 条明细上限截断
+    const manyTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-失败计数表',
+        columns: [{ label: '编号', key: 'code', type: 'text', required: true }],
+      },
+    });
+    const manyRows = [['编号', '备注']];
+    for (let i = 0; i < 40; i += 1) manyRows.push(['', `X-${i}`]);
+    const manyXlsx = await makeXlsx(manyRows);
+    const manyPreview = await api(`/tables/${manyTable.data.table.id}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(manyXlsx, 'many.xlsx'),
+    });
+    const manyCommit = await api(`/tables/${manyTable.data.table.id}/import/commit`, {
+      method: 'POST', token: adminToken,
+      body: {
+        token: manyPreview.data.token,
+        sheet: manyPreview.data.sheets[0].name,
+        mapping: { code: 0 },
+        mode: 'append',
+      },
+    });
+    check(
+      '40 行失败按 40 统计、明细截断到 30',
+      manyCommit.data.failed === 40
+        && manyCommit.data.errors.length === 30
+        && manyCommit.data.errorsTruncated === true,
+      JSON.stringify({ failed: manyCommit.data.failed, errors: manyCommit.data.errors?.length }),
+    );
+
+    // 16.11 下拉选项与日期格式校验
+    const enumTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-枚举日期表',
+        columns: [
+          { label: '等级', key: 'lvl', type: 'select', options: ['A', 'B'] },
+          { label: '日期', key: 'day', type: 'date' },
+        ],
+      },
+    });
+    const enumTableId = enumTable.data.table.id;
+    check(
+      '下拉列非选项值被拒绝(400)',
+      (await api(`/tables/${enumTableId}/rows`, { method: 'POST', token: adminToken, body: { lvl: 'Z' } })).status === 400,
+    );
+    check(
+      '日期列非法日历被拒绝(400)',
+      (await api(`/tables/${enumTableId}/rows`, { method: 'POST', token: adminToken, body: { day: '2026-13-99' } })).status === 400,
+    );
+    check(
+      '日期列合法值可保存',
+      (await api(`/tables/${enumTableId}/rows`, { method: 'POST', token: adminToken, body: { lvl: 'A', day: '2026-10-29' } })).status === 201,
+    );
+
+    // 16.12 表名重命名长度
+    check(
+      '重命名超长表名被拒绝(400)',
+      (await api(`/tables/${enumTableId}`, {
+        method: 'PATCH', token: adminToken, body: { name: '表'.repeat(40) },
+      })).status === 400,
+    );
+
+    // 16.12b Excel 日期单元格按 UTC 还原（不再硬编码 +8 小时）
+    const dateWb = new ExcelJS.Workbook();
+    const dateWs = dateWb.addWorksheet('日期');
+    dateWs.addRow(['日期']);
+    dateWs.addRow([new Date('2026-10-29T00:00:00Z')]);
+    const parsedDates = await parseWorkbook(Buffer.from(await dateWb.xlsx.writeBuffer()));
+    check(
+      'Excel 日期单元格不发生时区偏移',
+      parsedDates[0]?.rows[0]?.[0] === '2026-10-29',
+      JSON.stringify(parsedDates[0]?.rows),
+    );
+
+    // 16.13 台账 upsert 编号为空不能静默新增
+    const emptyCodeXlsx = await makeXlsx([['产品编号', '产品名称'], ['', '空编号产品']]);
+    const emptyCodePreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(emptyCodeXlsx, 'empty-code.xlsx'),
+    });
+    const emptyCodeCommit = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: emptyCodePreview.data.token,
+        sheet: emptyCodePreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'upsert',
+      },
+    });
+    check(
+      'upsert 空编号按行失败',
+      emptyCodeCommit.ok && emptyCodeCommit.data.inserted === 0 && emptyCodeCommit.data.failed === 1,
+      JSON.stringify(emptyCodeCommit.data),
+    );
+
+    // 16.13b 台账导入 40 行失败时也按真实行数统计
+    const manyLedgerRows = [['产品编号', '产品名称']];
+    for (let i = 0; i < 40; i += 1) manyLedgerRows.push(['', `L-${i}`]);
+    const manyLedgerXlsx = await makeXlsx(manyLedgerRows);
+    const manyLedgerPreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(manyLedgerXlsx, 'many-ledger.xlsx'),
+    });
+    const manyLedgerCommit = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: manyLedgerPreview.data.token,
+        sheet: manyLedgerPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'upsert',
+      },
+    });
+    check(
+      '台账导入 40 行失败按 40 统计',
+      manyLedgerCommit.data.failed === 40
+        && manyLedgerCommit.data.inserted === 0
+        && manyLedgerCommit.data.errors.length === 30
+        && manyLedgerCommit.data.errorsTruncated === true,
+      JSON.stringify({ failed: manyLedgerCommit.data.failed, errors: manyLedgerCommit.data.errors?.length }),
+    );
+
+    // 16.14 非法筛选 / 排序字段
+    check(
+      '非法 filters 返回 400',
+      (await api(`/tables/${productTable.id}/rows?filters=not-json`, { token: adminToken })).status === 400,
+    );
+    check(
+      '非法筛选运算符返回 400',
+      (await api(
+        `/tables/${productTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([{ field: 'code', op: 'regex', value: 'x' }]))}`,
+        { token: adminToken },
+      )).status === 400,
+    );
+    check(
+      '非法排序字段被忽略而不报错',
+      (await api(`/tables/${productTable.id}/rows?sortBy=__proto__&sortOrder=asc`, { token: adminToken })).ok,
+    );
+
+    // 16.15 登录锁定按 用户名 + IP，且不影响其他账号
+    await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'reglock', name: '锁定测试', password: 'lock123456', role: 'member' },
+    });
+    for (let i = 0; i < 6; i += 1) {
+      await api('/auth/login', { method: 'POST', body: { username: 'reglock', password: 'wrong' } });
+    }
+    check(
+      '连续失败后锁定(429)',
+      (await api('/auth/login', { method: 'POST', body: { username: 'reglock', password: 'lock123456' } })).status === 429,
+    );
+    check(
+      '锁定一个账号不影响管理员登录',
+      (await api('/auth/login', { method: 'POST', body: { username: 'admin', password: 'admin123' } })).ok,
+    );
+
+    // 16.16 upsert 合并时空单元格表示"不修改"，不清空已有台账字段
+    const keepEntry = await api('/ledger', {
+      method: 'POST', token: adminToken,
+      body: { code: 'P-KEEP', name: '保留值产品', price: 88, quantity: 5, remark: '重要备注', warehouse: 'A 区' },
+    });
+    check('准备台账 P-KEEP', keepEntry.ok, JSON.stringify(keepEntry.data));
+
+    const keepTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: { name: '空值同步表', columns: [
+        { label: '编号', type: 'text', required: true },
+        { label: '价格', type: 'number' },
+        { label: '备注', type: 'text' },
+      ] },
+    });
+    const keepCols = keepTable.data.table.columns;
+    const keepRow = await api(`/tables/${keepTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { [keepCols[0].key]: 'P-KEEP' }, // 价格 / 备注列留空
+    });
+    const keepSync = await api(`/tables/${keepTable.data.table.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: {
+        scope: 'selected', rowIds: [keepRow.data.row.id], mode: 'upsert',
+        mapping: { code: keepCols[0].key, price: keepCols[1].key, remark: keepCols[2].key },
+      },
+    });
+    const keepAfter = await api('/ledger?keyword=P-KEEP', { token: adminToken });
+    check(
+      '同步 upsert 空价格/空备注保持原值',
+      keepSync.data.updated === 1
+        && keepAfter.data.items[0]?.price === 88
+        && keepAfter.data.items[0]?.remark === '重要备注'
+        && keepAfter.data.items[0]?.warehouse === 'A 区',
+      JSON.stringify({ updated: keepSync.data.updated, item: keepAfter.data.items[0] }),
+    );
+
+    // 16.17 同步 insert 模式空价格仍按默认 0 落库
+    const newRow = await api(`/tables/${keepTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { [keepCols[0].key]: 'P-NEW-DEFAULT' },
+    });
+    const insertSync = await api(`/tables/${keepTable.data.table.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: {
+        scope: 'selected', rowIds: [newRow.data.row.id], mode: 'insert',
+        mapping: { code: keepCols[0].key, price: keepCols[1].key, remark: keepCols[2].key },
+      },
+    });
+    const insertAfter = await api('/ledger?keyword=P-NEW-DEFAULT', { token: adminToken });
+    check(
+      '同步 insert 空价格按默认 0 落库',
+      insertSync.data.created === 1 && insertAfter.data.items[0]?.price === 0,
+      JSON.stringify({ created: insertSync.data.created, item: insertAfter.data.items[0] }),
+    );
+
+    // 16.18 台账 Excel 导入 upsert 空单价保持原值；新增行空单价按默认 0
+    const keepXlsx = await makeXlsx([
+      ['产品编号', '单价(元)'],
+      ['P-KEEP', ''],
+      ['P-NEW-XLSX', ''],
+    ]);
+    const keepXlsxPreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(keepXlsx, 'keep.xlsx'),
+    });
+    const keepXlsxCommit = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: keepXlsxPreview.data.token,
+        sheet: keepXlsxPreview.data.sheets[0].name,
+        mapping: { code: 0, price: 1 },
+        mode: 'upsert',
+      },
+    });
+    const keepAfter2 = await api('/ledger?keyword=P-KEEP', { token: adminToken });
+    const newXlsxAfter = await api('/ledger?keyword=P-NEW-XLSX', { token: adminToken });
+    check(
+      '台账导入 upsert 空单价保持原值',
+      keepXlsxCommit.data.updated === 1 && keepAfter2.data.items[0]?.price === 88,
+      JSON.stringify({ commit: keepXlsxCommit.data, price: keepAfter2.data.items[0]?.price }),
+    );
+    check(
+      '台账导入新增行空单价按默认 0',
+      keepXlsxCommit.data.inserted === 1 && newXlsxAfter.data.items[0]?.price === 0,
+      JSON.stringify({ inserted: keepXlsxCommit.data.inserted, price: newXlsxAfter.data.items[0]?.price }),
+    );
   } finally {
     server.kill();
     await new Promise((r) => setTimeout(r, 300));

@@ -106,6 +106,7 @@ export interface ImportResult {
   failed: number;
   total: number;
   errors: { row: number | string; message: string }[];
+  errorsTruncated?: boolean;
   message: string;
 }
 

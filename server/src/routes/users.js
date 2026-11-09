@@ -1,7 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import { getDb, saveDbSoon, uid, now } from '../db.js';
-import { requireAuth, requireAdmin, publicUser, logAction } from '../auth.js';
+import { requireAuth, requireAdmin, publicUser, logAction, BCRYPT_ROUNDS } from '../auth.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -36,8 +36,9 @@ router.post('/', requireAdmin, (req, res) => {
     id: uid('u_'),
     username: uname,
     name: String(name || uname).trim(),
-    passwordHash: bcrypt.hashSync(String(password), 8),
+    passwordHash: bcrypt.hashSync(String(password), BCRYPT_ROUNDS),
     role,
+    tokenVersion: 0,
     createdAt: now(),
     updatedAt: now(),
     lastLoginAt: null,
@@ -61,11 +62,17 @@ router.patch('/:id', requireAdmin, (req, res) => {
     const admins = db.users.filter((u) => u.role === 'admin');
     if (admins.length <= 1) return res.status(400).json({ message: '至少保留一名管理员' });
   }
-  if (name !== undefined) user.name = String(name).trim() || user.name;
+  if (name !== undefined) {
+    const next = String(name).trim();
+    if (next.length > 20) return res.status(400).json({ message: '姓名最多 20 个字' });
+    if (next) user.name = next;
+  }
   if (role) user.role = role;
   if (password) {
     if (String(password).length < 6) return res.status(400).json({ message: '密码至少 6 位' });
-    user.passwordHash = bcrypt.hashSync(String(password), 8);
+    user.passwordHash = bcrypt.hashSync(String(password), BCRYPT_ROUNDS);
+    // 管理员重置密码后，该用户已登录的会话立即失效
+    user.tokenVersion = (user.tokenVersion ?? 0) + 1;
   }
   user.updatedAt = now();
   saveDbSoon();
@@ -83,27 +90,31 @@ router.delete('/:id', requireAdmin, (req, res) => {
   if (user.role === 'admin' && db.users.filter((u) => u.role === 'admin').length <= 1) {
     return res.status(400).json({ message: '至少保留一名管理员' });
   }
-  // 删除前把该用户名下的表格与数据转交给当前管理员，避免出现“未知创建者”的悬空数据
+  // 删除前把该用户名下的表格、表格数据与台账转交给当前管理员，避免出现“未知创建者”的悬空数据。
+  // 只改 createdBy（决定编辑权限与归属展示），updatedBy 保留原值以维持审计痕迹。
   const tables = db.tables.filter((t) => t.ownerId === user.id);
-  const rows = db.rows.filter((r) => r.createdBy === user.id || r.updatedBy === user.id);
+  const rows = db.rows.filter((r) => r.createdBy === user.id);
+  const ledger = db.ledger.filter((l) => l.createdBy === user.id);
   for (const t of tables) {
     t.ownerId = req.user.id;
     t.updatedAt = now();
   }
-  for (const r of rows) {
-    if (r.createdBy === user.id) r.createdBy = req.user.id;
-    if (r.updatedBy === user.id) r.updatedBy = req.user.id;
+  for (const r of rows) r.createdBy = req.user.id;
+  for (const l of ledger) {
+    l.createdBy = req.user.id;
+    l.updatedAt = now();
   }
   db.users = db.users.filter((u) => u.id !== req.params.id);
   saveDbSoon();
-  const transfer = tables.length || rows.length
-    ? `，${tables.length} 张表格与 ${rows.length} 条数据已转交给 ${req.user.name || req.user.username}`
+  const transfer = tables.length || rows.length || ledger.length
+    ? `，${tables.length} 张表格、${rows.length} 条数据、${ledger.length} 条台账已转交给 ${req.user.name || req.user.username}`
     : '';
   logAction(req.user, '删除用户', user.username, `账号及登录权限已移除${transfer}`);
   res.json({
     message: `已删除用户「${user.name || user.username}」${transfer}`,
     transferredTables: tables.length,
     transferredRows: rows.length,
+    transferredLedger: ledger.length,
   });
 });
 

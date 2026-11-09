@@ -6,7 +6,8 @@ import { buildWorkbook, buildLedgerTemplate, parseWorkbook } from '../excel.js';
 import { putSession, getSession } from '../import-sessions.js';
 import { LEDGER_FIELDS, LEDGER_WRITABLE_FIELDS, ledgerAmount } from '../ledger-fields.js';
 import { applyFilters, matchesKeyword, paginate, parseFilters, sortRows } from '../query.js';
-import { findTableOr404, normalizeRowData, validateRow } from '../store.js';
+import { normalizeRowData, validateRow } from '../store.js';
+import { canEditLedger, readLedgerPayload, validateLedgerEntry } from '../ledger-service.js';
 import { HttpError, asyncHandler, setDownloadHeaders, stamp } from '../http.js';
 
 const router = express.Router();
@@ -14,11 +15,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 router.use(requireAuth);
 
 const SEARCH_KEYS = ['code', 'name', 'spec', 'category', 'warehouse', 'supplier', 'remark'];
-
-/** 成员只能维护自己录入的台账，管理员不受限（与表格行、删除权限保持同一规则） */
-function canEditLedger(user, entry) {
-  return user.role === 'admin' || entry.createdBy === user.id;
-}
+const SORT_KEYS = new Set([...LEDGER_FIELDS.map((f) => f.key), 'amount']);
 
 function decorate(entry, user) {
   const db = getDb();
@@ -41,7 +38,9 @@ function collectLedger(query) {
   if (query.warehouse) rows = rows.filter((r) => r.warehouse === query.warehouse);
   const filters = parseFilters(query.filters);
   rows = applyFilters(rows, filters, (row, field) => (field === 'amount' ? ledgerAmount(row) : row[field]));
-  return sortRows(rows, query.sortBy || 'updatedAt', query.sortOrder || 'desc', (row, field) =>
+  // 排序字段白名单：非法字段回落到默认的"更新时间倒序"
+  const sortBy = SORT_KEYS.has(String(query.sortBy || '')) ? query.sortBy : 'updatedAt';
+  return sortRows(rows, sortBy, query.sortOrder || 'desc', (row, field) =>
     field === 'amount' ? ledgerAmount(row) : row[field],
   );
 }
@@ -91,29 +90,6 @@ router.get('/export', asyncHandler(async (req, res) => {
   res.send(buffer);
 }));
 
-function readLedgerPayload(body) {
-  const payload = {};
-  for (const f of LEDGER_WRITABLE_FIELDS) {
-    if (body[f.key] === undefined) continue;
-    const raw = body[f.key];
-    if (f.type === 'number') {
-      const text = String(raw ?? '').replace(/,/g, '').trim();
-      if (text === '') {
-        payload[f.key] = 0;
-        continue;
-      }
-      const n = Number(text);
-      if (!Number.isFinite(n)) {
-        throw new HttpError(400, `「${f.label}」必须是有效数字，收到：${String(raw).slice(0, 20)}`);
-      }
-      payload[f.key] = n;
-    } else {
-      payload[f.key] = String(raw ?? '').trim();
-    }
-  }
-  return payload;
-}
-
 router.post('/', (req, res) => {
   const payload = readLedgerPayload(req.body || {});
   if (!payload.code) throw new HttpError(400, '产品编号不能为空');
@@ -141,6 +117,7 @@ router.post('/', (req, res) => {
     createdBy: req.user.id,
     updatedBy: req.user.id,
   };
+  validateLedgerEntry(entry);
   db.ledger.push(entry);
   saveDbSoon();
   logAction(req.user, '新增台账', entry.code, entry.name);
@@ -155,12 +132,13 @@ router.patch('/:id', (req, res) => {
     throw new HttpError(403, '只能修改自己录入的台账，或联系管理员处理');
   }
   const payload = readLedgerPayload(req.body || {});
-  if (payload.code) {
-    const dup = db.ledger.find(
-      (l) => l.id !== entry.id && String(l.code).toLowerCase() === payload.code.toLowerCase(),
-    );
-    if (dup) throw new HttpError(400, `产品编号 ${payload.code} 已被其他记录使用`);
-  }
+  // 与旧值合并后整体校验：传空字符串不能绕过必填校验，状态/数字范围也必须始终成立
+  const merged = { ...entry, ...payload };
+  validateLedgerEntry(merged);
+  const dup = db.ledger.find(
+    (l) => l.id !== entry.id && String(l.code).toLowerCase() === String(merged.code).toLowerCase(),
+  );
+  if (dup) throw new HttpError(400, `产品编号 ${merged.code} 已被其他记录使用`);
   Object.assign(entry, payload, { updatedAt: now(), updatedBy: req.user.id });
   saveDbSoon();
   logAction(req.user, '修改台账', entry.code, entry.name);
@@ -263,9 +241,17 @@ router.post('/import/commit', (req, res) => {
     db.ledger.map((l) => String(l.code ?? '').trim().toLowerCase()).filter(Boolean),
   );
 
+  const MAX_ERROR_ROWS = 30;
   let inserted = 0;
   let updated = 0;
+  let failed = 0;
   const errors = [];
+  // failed 统计真实失败行数，errors 只保留前 30 条明细，避免"失败 40 行只报 30"的误报
+  const fail = (row, message) => {
+    failed += 1;
+    if (errors.length < MAX_ERROR_ROWS) errors.push({ row, message });
+  };
+
   source.rows.forEach((cells, i) => {
     if (!cells.some((c) => String(c ?? '').trim() !== '')) return;
     const payload = {};
@@ -277,43 +263,47 @@ router.post('/import/commit', (req, res) => {
     });
     if (badNumber) {
       const f = LEDGER_WRITABLE_FIELDS.find((x) => x.key === badNumber[0]);
-      if (errors.length < 30) {
-        errors.push({ row: i + 2, message: `「${f.label}」不是有效数字：${cells[badNumber[1]]}` });
-      }
+      fail(i + 2, `「${f.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     let clean;
     try {
-      clean = readLedgerPayload(payload);
+      // upsert 更新已有记录时空单元格表示"不修改"，不把空值覆盖成 0 / 空串；
+      // 新增分支的默认值在下方 entry 构造时兜底，行为不变
+      clean = readLedgerPayload(payload, { skipEmpty: mode === 'upsert' });
     } catch (err) {
-      if (errors.length < 30) errors.push({ row: i + 2, message: err.message || '数据格式不正确' });
+      fail(i + 2, err.message || '数据格式不正确');
       return;
     }
     if (!clean.name && !clean.code) {
-      if (errors.length < 30) errors.push({ row: i + 2, message: '产品名称与产品编号均为空' });
+      fail(i + 2, '产品名称与产品编号均为空');
       return;
     }
     // 追加模式不覆盖已有记录；编号已存在时按行失败，避免绕过「编号唯一」制造重复台账
     if (mode === 'append' && clean.code) {
       const key = clean.code.trim().toLowerCase();
       if (existingCodes.has(key)) {
-        if (errors.length < 30) {
-          errors.push({
-            row: i + 2,
-            message: `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`,
-          });
-        }
+        fail(i + 2, `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`);
         return;
       }
     }
     if (mode === 'upsert') {
-      const key = String(clean.code || '').toLowerCase();
-      const found = key ? index.get(key) : null;
+      const key = String(clean.code || '').trim().toLowerCase();
+      // 编号为空时不能匹配，也不能静默降级成"新增 AUTO 编号"
+      if (!key) {
+        fail(i + 2, '产品编号为空，无法按编号匹配更新');
+        return;
+      }
+      const found = index.get(key);
       if (found) {
         if (!canEditLedger(req.user, found)) {
-          if (errors.length < 30) {
-            errors.push({ row: i + 2, message: '无权覆盖他人录入的台账，可联系管理员处理' });
-          }
+          fail(i + 2, '无权覆盖他人录入的台账，可联系管理员处理');
+          return;
+        }
+        try {
+          validateLedgerEntry({ ...found, ...clean });
+        } catch (err) {
+          fail(i + 2, err.message);
           return;
         }
         Object.assign(found, clean, { updatedAt: now(), updatedBy: req.user.id });
@@ -340,6 +330,12 @@ router.post('/import/commit', (req, res) => {
       createdBy: req.user.id,
       updatedBy: req.user.id,
     };
+    try {
+      validateLedgerEntry(entry);
+    } catch (err) {
+      fail(i + 2, err.message);
+      return;
+    }
     db.ledger.push(entry);
     if (entry.code) index.set(String(entry.code).toLowerCase(), entry);
     existingCodes.add(String(entry.code).trim().toLowerCase());
@@ -347,14 +343,15 @@ router.post('/import/commit', (req, res) => {
   });
 
   saveDbSoon();
-  logAction(req.user, '导入台账 Excel', '台账', `新增 ${inserted} 条，更新 ${updated} 条，失败 ${errors.length} 条`);
+  logAction(req.user, '导入台账 Excel', '台账', `新增 ${inserted} 条，更新 ${updated} 条，失败 ${failed} 条`);
   res.json({
     inserted,
     updated,
-    failed: errors.length,
+    failed,
     total: source.rows.length,
     errors,
-    message: `台账导入完成：新增 ${inserted} 条${updated ? `，更新 ${updated} 条` : ''}${errors.length ? `，${errors.length} 条失败` : ''}`,
+    errorsTruncated: failed > errors.length,
+    message: `台账导入完成：新增 ${inserted} 条${updated ? `，更新 ${updated} 条` : ''}${failed ? `，${failed} 条失败` : ''}`,
   });
 });
 
@@ -377,12 +374,14 @@ router.post('/to-table', (req, res) => {
   let inserted = 0;
   const errors = [];
 
+  let failed = 0;
   for (const entry of entries) {
     const input = {};
     for (const [colKey, field] of pairs) input[colKey] = entry[field] ?? '';
     const data = normalizeRowData(table, input);
     const rowErrors = validateRow(table, data);
     if (rowErrors.length) {
+      failed += 1;
       if (errors.length < 30) errors.push({ row: entry.code, message: rowErrors.join('；') });
       continue;
     }
@@ -400,12 +399,13 @@ router.post('/to-table', (req, res) => {
 
   table.updatedAt = now();
   saveDbSoon();
-  logAction(req.user, '台账导入表格', table.name, `导入 ${inserted} 条，失败 ${errors.length} 条`);
+  logAction(req.user, '台账导入表格', table.name, `导入 ${inserted} 条，失败 ${failed} 条`);
   res.json({
     inserted,
-    failed: errors.length,
+    failed,
     errors,
-    message: `已导入表格「${table.name}」 ${inserted} 条${errors.length ? `，${errors.length} 条校验失败` : ''}`,
+    errorsTruncated: failed > errors.length,
+    message: `已导入表格「${table.name}」 ${inserted} 条${failed ? `，${failed} 条校验失败` : ''}`,
   });
 });
 
