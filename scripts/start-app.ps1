@@ -22,7 +22,7 @@ function Pause-IfNeeded {
 
 $url    = "http://127.0.0.1:$Port"
 $logDir = Join-Path $root 'logs'
-$pidFile = Join-Path $logDir 'server.pid'
+$pidFile = Join-Path $logDir "server-$Port.pid"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 function Test-PortOpen([int]$p) {
@@ -32,12 +32,24 @@ function Test-PortOpen([int]$p) {
   finally { $client.Dispose() }
 }
 
-# 端口通不代表是本系统：必须 /api/health 返回 200
+# 端口通不代表是本系统：必须 /api/health 返回 200，且响应体带本系统标识
 function Test-ServiceUp([int]$p) {
   try {
     $resp = Invoke-WebRequest "http://127.0.0.1:$p/api/health" -UseBasicParsing -TimeoutSec 2
-    return ($resp.StatusCode -eq 200)
+    if ($resp.StatusCode -ne 200) { return $false }
+    $body = $resp.Content | ConvertFrom-Json
+    return ($body.ok -eq $true -and $body.app -eq 'product-ledger')
   } catch { return $false }
+}
+
+# 端口就绪后从监听套接字反查真实 PID，写进按端口隔离的 PID 文件
+function Save-ListenerPid([int]$p, [string]$file) {
+  $listener = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($listener) {
+    $listener.OwningProcess | Set-Content -Path $file -Encoding ASCII
+    return $true
+  }
+  return $false
 }
 
 function Get-LanIps {
@@ -103,12 +115,13 @@ if ($nodeMajor -lt 20) {
 if (Test-PortOpen $Port) {
   if (Test-ServiceUp $Port) {
     Write-Host "服务已经在运行（端口 $Port），直接打开页面。" -ForegroundColor Yellow
+    [void](Save-ListenerPid $Port $pidFile)
     if (-not $NoBrowser) { Start-Process $url }
     Show-Lan
     Start-Sleep -Seconds 2
     exit 0
   }
-  Write-Host "端口 $Port 已被其他程序占用（访问 /api/health 无效），无法启动。" -ForegroundColor Red
+  Write-Host "端口 $Port 已被其他程序占用（/api/health 不是本系统），无法启动。" -ForegroundColor Red
   Write-Host '请关闭占用该端口的程序，或用 -Port 指定其他端口。' -ForegroundColor DarkGray
   Pause-IfNeeded
   exit 1
@@ -136,22 +149,27 @@ if ($Rebuild -or (Test-NeedBuild)) {
 }
 
 Write-Host '正在启动服务…' -ForegroundColor Yellow
-$outLog = Join-Path $logDir 'server.log'
-$errLog = Join-Path $logDir 'server.err.log'
+# 日志按端口区分：多个实例（例如 4399 生产 + 4409 测试）不会互相占用日志文件
+$outLog = Join-Path $logDir "server-$Port.log"
+$errLog = Join-Path $logDir "server-$Port.err.log"
 # 覆盖式重定向会丢失上次排障线索，启动前保留一份上一版日志
 foreach ($file in @($outLog, $errLog)) {
-  if (Test-Path $file) { Move-Item -Path $file -Destination "$file.prev" -Force }
+  if (-not (Test-Path $file)) { continue }
+  try {
+    Move-Item -Path $file -Destination "$file.prev" -Force -ErrorAction Stop
+  } catch {
+    # 日志正被已有服务占用时轮转会失败；这不应该阻断本次启动
+    Write-Host ("日志文件被占用，跳过轮转：{0}" -f (Split-Path $file -Leaf)) -ForegroundColor DarkGray
+  }
 }
 $node = (Get-Command node).Source
-
-# 关键：把端口通过环境变量传给子进程，否则服务端恒监听 4399
-$env:PORT = "$Port"
 
 # 通过 scripts\run-server.cmd（ShellExecute 启动）拉起服务：
 # 不走 -RedirectStandardOutput，避免常驻 node 继承本脚本的输出句柄，
 # 否则脚本被管道 / 计划任务调用时会「服务已启动但调用方一直不返回」。
+# 端口作为参数传给 cmd，由它设置子进程的 PORT，避免污染当前 PowerShell 会话。
 $runner = Join-Path $PSScriptRoot 'run-server.cmd'
-Start-Process -FilePath $env:ComSpec -ArgumentList '/c', "`"$runner`"" -WindowStyle Hidden
+Start-Process -FilePath $env:ComSpec -ArgumentList '/c', "`"$runner`" $Port" -WindowStyle Hidden
 
 $ok = $false
 for ($i = 0; $i -lt 60; $i++) {
@@ -172,11 +190,8 @@ if (-not $ok) {
   exit 1
 }
 
-# 端口起来了再从监听套接字反查真实 PID，写进 PID 文件供停止脚本使用
-$listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($listener) {
-  $listener.OwningProcess | Set-Content -Path $pidFile -Encoding ASCII
-}
+# 端口起来了再从监听套接字反查真实 PID，写进按端口隔离的 PID 文件供停止脚本使用
+[void](Save-ListenerPid $Port $pidFile)
 
 Write-Host ''
 Write-Host '✓ 启动成功' -ForegroundColor Green

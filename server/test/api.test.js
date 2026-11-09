@@ -611,10 +611,142 @@ async function main() {
   const adminOwnedAfter = ledgerAfter.data.items.find((x) => x.id === adminOwned.id);
   check('他人台账内容未被改动', adminOwnedAfter?.name === adminOwnedName, String(adminOwnedAfter?.name));
 
+  const ledgerBadMode = await api('/ledger/import/commit', {
+    method: 'POST',
+    token: memberToken,
+    body: {
+      token: ledgerPermPreview.data.token,
+      sheet: ledgerPermPreview.data.sheets[0].name,
+      mapping: { name: 1 },
+      mode: 'foo',
+    },
+  });
+  check(
+    '台账导入非法 mode 被拒绝(400)',
+    ledgerBadMode.status === 400 && /导入方式/.test(ledgerBadMode.data?.message || ''),
+    JSON.stringify(ledgerBadMode.data),
+  );
+
   await api(`/ledger/${memberEntryId}`, { method: 'DELETE', token: adminToken });
   await api(`/ledger/${emptyNumbers.data.item.id}`, { method: 'DELETE', token: adminToken });
 
-  console.log('\n== 13. 删除表格（级联）==');
+  console.log('\n== 14. 本轮修复回归（数字/文本/导入）==');
+
+  const healthRes = await api('/health');
+  check(
+    '健康检查带应用标识',
+    healthRes.ok && healthRes.data?.ok === true && healthRes.data?.app === 'product-ledger',
+    JSON.stringify(healthRes.data),
+  );
+
+  const badQtyRow = await api(`/tables/${tableId}/rows`, {
+    method: 'POST',
+    token: adminToken,
+    body: { code: 'N-1', name: '非法数字行', qty: 'abc' },
+  });
+  check(
+    '表格数字列非法值被拒绝(400)',
+    badQtyRow.status === 400 && /数量/.test(badQtyRow.data?.message || ''),
+    JSON.stringify(badQtyRow.data),
+  );
+
+  const goodQtyRow = await api(`/tables/${tableId}/rows`, {
+    method: 'POST',
+    token: adminToken,
+    body: { code: 'N-2', name: '合法数字行', qty: '12' },
+  });
+  check(
+    '合法数字正常保存为 number',
+    goodQtyRow.status === 201 && goodQtyRow.data?.row?.data?.qty === 12,
+    JSON.stringify(goodQtyRow.data),
+  );
+
+  const badQtyPatch = await api(`/tables/${tableId}/rows/${goodQtyRow.data.row.id}`, {
+    method: 'PATCH',
+    token: adminToken,
+    body: { qty: 'oops' },
+  });
+  check('表格数字列 PATCH 非法值被拒绝(400)', badQtyPatch.status === 400, JSON.stringify(badQtyPatch.data));
+
+  const longName = '长'.repeat(2001);
+  const longRow = await api(`/tables/${tableId}/rows`, {
+    method: 'POST',
+    token: adminToken,
+    body: { code: 'T-1', name: longName },
+  });
+  check(
+    '文本超过 2000 字符被拒绝(400)',
+    longRow.status === 400 && /2000/.test(longRow.data?.message || ''),
+    JSON.stringify(longRow.data),
+  );
+
+  const boundaryRow = await api(`/tables/${tableId}/rows`, {
+    method: 'POST',
+    token: adminToken,
+    body: { code: 'T-2', name: '长'.repeat(2000) },
+  });
+  check('2000 字符边界可保存', boundaryRow.status === 201, JSON.stringify(boundaryRow.data));
+
+  const dupCode = 'P-REG-9001';
+  for (const [idx, expect] of [[1, { inserted: 1, failed: 0 }], [2, { inserted: 0, failed: 1 }]]) {
+    const dupXlsx = await makeXlsx([
+      ['产品编号', '产品名称'],
+      [dupCode, `重复编号第 ${idx} 次`],
+    ]);
+    const dupPreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(dupXlsx, `dup-${idx}.xlsx`),
+    });
+    const dupCommit = await api('/ledger/import/commit', {
+      method: 'POST',
+      token: adminToken,
+      body: {
+        token: dupPreview.data.token,
+        sheet: dupPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'append',
+      },
+    });
+    if (idx === 1) {
+      check('追加导入新编号成功', dupCommit.ok && dupCommit.data.inserted === 1, JSON.stringify(dupCommit.data));
+    } else {
+      check(
+        '追加导入重复编号被拒绝(行级失败)',
+        dupCommit.ok && dupCommit.data.failed === 1 && /已存在/.test(dupCommit.data.errors?.[0]?.message || ''),
+        JSON.stringify(dupCommit.data),
+      );
+    }
+    void expect;
+  }
+
+  const dupLedger = await api('/ledger?keyword=' + encodeURIComponent(dupCode), { token: adminToken });
+  check('台账中该编号只有 1 条', dupLedger.data.items.filter((x) => x.code === dupCode).length === 1);
+
+  const noModeXlsx = await makeXlsx([['产品编号', '产品名称'], ['P-REG-9002', '缺 mode']]);
+  const noModePreview = await api('/ledger/import/preview', {
+    method: 'POST', token: adminToken, body: toForm(noModeXlsx, 'nomode.xlsx'),
+  });
+  const noModeCommit = await api('/ledger/import/commit', {
+    method: 'POST',
+    token: adminToken,
+    body: {
+      token: noModePreview.data.token,
+      sheet: noModePreview.data.sheets[0].name,
+      mapping: { code: 0, name: 1 },
+    },
+  });
+  check(
+    '台账导入缺少 mode 被拒绝(400)',
+    noModeCommit.status === 400 && /导入方式/.test(noModeCommit.data?.message || ''),
+    JSON.stringify(noModeCommit.data),
+  );
+
+  const noModeLedger = await api('/ledger?keyword=P-REG-9002', { token: adminToken });
+  check('缺少 mode 时没有写入数据', noModeLedger.data.items.length === 0);
+
+  await api(`/tables/${tableId}/rows/${goodQtyRow.data.row.id}`, { method: 'DELETE', token: adminToken });
+  await api(`/tables/${tableId}/rows/${boundaryRow.data.row.id}`, { method: 'DELETE', token: adminToken });
+
+  console.log('\n== 15. 删除表格（级联）==');
     const delTable = await api(`/tables/${tableId}`, { method: 'DELETE', token: adminToken });
     check('管理员删除表格', delTable.ok);
     check('表格已消失', (await api(`/tables/${tableId}`, { token: adminToken })).status === 404);

@@ -104,12 +104,12 @@ npm start         # 启动服务，访问 http://127.0.0.1:4399
 | --- | --- |
 | `创建桌面快捷方式.cmd` | 在桌面生成「仓储产品台账」「停止台账系统」两个快捷方式（带应用图标） |
 | `启动台账系统.cmd` | 检查 Node 环境（>= 20）→ 必要时 `npm install`，前端源码有更新时自动 `npm run build` → 后台启动服务 → 自动打开浏览器 |
-| `停止台账系统.cmd` | 校验进程身份后停止本系统的 Node 服务（不会误杀占用 4399 的其他程序） |
+| `停止台账系统.cmd` | 只停止本项目的 Node 进程（按绝对入口路径或 `--app product-ledger` 标记识别），不会误杀其他程序 |
 | `启用局域网访问.cmd` | 以管理员权限放行 Windows 防火墙的 4399 端口（仅专用/域网络）；支持 `-AllowPublic`、`-Restore` |
 
-启动脚本 `scripts/start-app.ps1` 支持 `-Port 5000`（通过 `PORT` 环境变量传给服务端）、`-Rebuild`（强制重建前端）、`-NoBrowser`（不打开浏览器）。实际动作：检查 Node 版本 → 必要时安装依赖 → `web/dist` 缺失或前端源码比构建产物新时自动构建 → 后台运行 `node server/src/index.js`，PID 写入 `logs/server.pid` → 轮询 `/api/health` 直到就绪 → 打开浏览器。服务输出写到 `logs/server.log` 与 `logs/server.err.log`（每次启动前保留一份 `.prev`）。如果端口已被**本系统**占用则跳过启动；被其他程序占用会直接报错，不会把别人的页面当成自己的。
+启动脚本 `scripts/start-app.ps1` 支持 `-Port 5000`（端口作为参数传给 `run-server.cmd`，由它设置服务端的 `PORT`）、`-Rebuild`（强制重建前端）、`-NoBrowser`（不打开浏览器）。实际动作：检查 Node 版本 → 必要时安装依赖 → `web/dist` 缺失或前端源码比构建产物新时自动构建 → 后台运行 `node server\src\index.js --app product-ledger`，PID 写入 `logs/server-<端口>.pid` → 轮询 `/api/health` 直到就绪（要求返回 `{ ok: true, app: "product-ledger" }`，只有 200 不算）→ 打开浏览器。服务输出按端口写到 `logs/server-<端口>.log` 与 `logs/server-<端口>.err.log`（每次启动前保留一份 `.prev`），多实例互不占用日志。如果端口已被**本系统**占用则跳过启动并补写 PID 文件；被其他程序占用会直接报错，不会把别人的页面当成自己的。
 
-停止脚本 `scripts/stop-app.ps1` 支持 `-Port 5000` 与 `-NonInteractive`。它只停「PID 文件记录且确实在指定端口监听」或「指定端口上确实属于本项目的 node.exe」的进程；PID 文件与 `-Port` 不一致时不会误杀其他实例。`-NonInteractive` 供脚本/计划任务调用，结束时不再等待回车。
+停止脚本 `scripts/stop-app.ps1` 支持 `-Port 5000` 与 `-NonInteractive`。它只停「PID 文件记录、确实是 node 且确实在指定端口监听」或「指定端口上命令行含本项目绝对入口路径 / `--app product-ledger` 标记的 node」的进程；PID 文件与 `-Port` 不一致时不会误杀其他实例。`-NonInteractive` 供脚本/计划任务调用，结束时不再等待回车。
 
 > 服务实际由 `scripts/run-server.cmd` 拉起（由 `start-app.ps1` 通过 ShellExecute 启动）。这样常驻的 node 进程不会继承调用方的标准输出句柄，`powershell -File scripts\start-app.ps1 -NoBrowser | Select-Object -Last 5` 这类管道/自动化调用才能在几秒内正常返回。
 
@@ -160,7 +160,7 @@ product-ledger/
 ├─ 创建桌面快捷方式.cmd        # 双击：在桌面创建带图标的快捷方式
 ├─ 启用局域网访问.cmd          # 右键或以管理员运行：放行防火墙 4399 端口
 ├─ scripts/                   # 一键启动相关 PowerShell 脚本
-├─ logs/                      # 一键启动时的服务日志（server.log / server.err.log）
+├─ logs/                      # 一键启动时的服务日志（server-<端口>.log / .err.log）
 ├─ server/                  # 后端（Express，纯 ESM，无需构建）
 │  ├─ src/
 │  │  ├─ index.js           # 入口：中间件、路由挂载、静态托管、错误处理
@@ -201,6 +201,8 @@ product-ledger/
 3. 追加模式：全部作为新数据写入；更新模式：按选定业务键（如产品编号）匹配，存在则更新、不存在则新增
 4. 数字列必须是合法数字，日期列支持 `2026-10-29`、`2026/10/29`、Excel 日期格式
 5. 导入结果会显示新增 / 更新 / 失败数量及失败原因（最多展示 30 条）
+6. 台账导入必须显式指定 `mode`（`append` 或 `upsert`）：`append` 遇到已存在的产品编号会按行失败（不会覆盖、也不会生成重复台账），要覆盖请用 `upsert`；直接调接口不传 `mode` 会返回 400
+7. 文本字段（text/textarea）单值上限 2000 字符，超出会按行失败并提示当前长度
 
 ## 接口概览
 
@@ -248,3 +250,5 @@ product-ledger/
 - 前端构建脚本 `web/scripts/build.mjs` 会把临时目录指向 `web/.tmp`，用于规避本机 `%TEMP%` 下 esbuild 的 `Access is denied` 问题
 - 页面按路由懒加载，antd 独立缓存为 vendor 分包；服务端开启 gzip，`/assets` 长缓存、HTML 不缓存
 - 收到 SIGINT / SIGTERM 时会先把内存中的改动刷盘再退出
+- 表格数字列与台账一致：非数字内容会返回 400（不再静默存成 `null`）；文本列单值上限 2000 字符
+- 停止脚本通过「绝对入口路径」或 `--app product-ledger` 标记识别本项目进程；用 `node src/index.js` 手工启动的旧进程不在识别范围内（建议统一用 `npm start` 或启动脚本）

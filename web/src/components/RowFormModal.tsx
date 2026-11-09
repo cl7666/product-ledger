@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { DatePicker, Form, Input, InputNumber, Modal, Select, App as AntdApp } from 'antd';
 import dayjs from 'dayjs';
 import type { DataRow, DataTable } from '../types';
@@ -16,6 +16,8 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
   const [form] = Form.useForm();
   const { message } = AntdApp.useApp();
   const [saving, setSaving] = useState(false);
+  // 同步置位的提交锁：saving 是异步 state，挡不住同一 tick 内的两次点击
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -32,8 +34,9 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
   }, [open, row, table.columns, form]);
 
   const submit = async () => {
-    // 提交中禁止再次触发，避免连点产生重复数据
-    if (saving) return;
+    // 提交中禁止再次触发，避免连点产生重复数据（ref 同步置位，state 只负责 UI）
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     try {
       const values = await form.validateFields();
       const payload: Record<string, unknown> = {};
@@ -56,6 +59,7 @@ export default function RowFormModal({ open, table, row, onCancel, onSaved }: Pr
       if ((err as { errorFields?: unknown }).errorFields) return;
       message.error((err as Error).message);
     } finally {
+      submittingRef.current = false;
       setSaving(false);
     }
   };

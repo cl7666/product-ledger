@@ -225,11 +225,18 @@ router.post(
 );
 
 router.post('/import/commit', (req, res) => {
-  const { token, sheet, mapping, mode = 'upsert', dedupeKey = 'code' } = req.body || {};
-  const session = getSession(token, req.user.id);
-  if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
-  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
-  const db = getDb();
+  const { token, sheet, mapping, dedupeKey = 'code' } = req.body || {};
+
+  // mode 必须显式给出：默认 upsert 会让「以为在追加」的调用方静默覆盖已有台账
+  if (req.body?.mode === undefined || req.body?.mode === null || String(req.body.mode).trim() === '') {
+    throw new HttpError(400, '请指定导入方式：append（追加）或 upsert（按编号匹配更新）');
+  }
+  const mode = String(req.body.mode).trim().toLowerCase();
+
+  // 参数校验放在读取导入会话之前，与表格导入保持一致；非法 mode 直接拒绝，避免静默降级
+  if (!['append', 'upsert'].includes(mode)) {
+    throw new HttpError(400, '导入方式只能是 append（追加）或 upsert（按编号匹配更新）');
+  }
   const pairs = Object.entries(mapping || {})
     .map(([field, index]) => [field, Number(index)])
     .filter(([field, idx]) => LEDGER_WRITABLE_FIELDS.some((f) => f.key === field) && Number.isInteger(idx) && idx >= 0);
@@ -242,10 +249,19 @@ router.post('/import/commit', (req, res) => {
     }
   }
 
+  const session = getSession(token, req.user.id);
+  if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
+  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
+  const db = getDb();
+
   const index = new Map();
   for (const l of db.ledger) {
     if (dedupeKey === 'code') index.set(String(l.code).toLowerCase(), l);
   }
+  // 追加模式也要知道哪些编号已存在：否则会绕过「编号唯一」不变式，制造重复台账
+  const existingCodes = new Set(
+    db.ledger.map((l) => String(l.code ?? '').trim().toLowerCase()).filter(Boolean),
+  );
 
   let inserted = 0;
   let updated = 0;
@@ -276,6 +292,19 @@ router.post('/import/commit', (req, res) => {
     if (!clean.name && !clean.code) {
       if (errors.length < 30) errors.push({ row: i + 2, message: '产品名称与产品编号均为空' });
       return;
+    }
+    // 追加模式不覆盖已有记录；编号已存在时按行失败，避免绕过「编号唯一」制造重复台账
+    if (mode === 'append' && clean.code) {
+      const key = clean.code.trim().toLowerCase();
+      if (existingCodes.has(key)) {
+        if (errors.length < 30) {
+          errors.push({
+            row: i + 2,
+            message: `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`,
+          });
+        }
+        return;
+      }
     }
     if (mode === 'upsert') {
       const key = String(clean.code || '').toLowerCase();
@@ -313,6 +342,7 @@ router.post('/import/commit', (req, res) => {
     };
     db.ledger.push(entry);
     if (entry.code) index.set(String(entry.code).toLowerCase(), entry);
+    existingCodes.add(String(entry.code).trim().toLowerCase());
     inserted += 1;
   });
 

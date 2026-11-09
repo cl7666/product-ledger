@@ -71,6 +71,9 @@ export function toDateOnly(value) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/** 文本列允许的最大字符数（与 Excel 单元格上限保持一致的量级，避免单行撑爆导出） */
+export const MAX_TEXT_LENGTH = 2000;
+
 export function normalizeRowData(table, input) {
   const data = {};
   for (const col of table.columns) {
@@ -80,8 +83,11 @@ export function normalizeRowData(table, input) {
       continue;
     }
     if (col.type === 'number') {
-      const n = Number(String(raw).replace(/,/g, '').trim());
-      data[col.key] = Number.isFinite(n) ? n : null;
+      const text = String(raw).replace(/,/g, '').trim();
+      const n = Number(text);
+      // 非法数字保留原文，交给 validateRow 报「必须是数字」；
+      // 直接存 null 会让用户以为保存成功（必填列还会误报「不能为空」）
+      data[col.key] = Number.isFinite(n) ? n : text;
     } else if (col.type === 'date') {
       data[col.key] = toDateOnly(raw);
     } else {
@@ -94,13 +100,15 @@ export function normalizeRowData(table, input) {
 export function validateRow(table, data, { partial = false } = {}) {
   const errors = [];
   for (const col of table.columns) {
-    if (!col.required) continue;
     const v = data[col.key];
     const empty = v === undefined || v === null || v === '';
     if (partial && v === undefined) continue;
-    if (empty) errors.push(`${col.label} 不能为空`);
+    if (col.required && empty) errors.push(`${col.label} 不能为空`);
     if (col.type === 'number' && !empty && typeof v !== 'number') {
       errors.push(`${col.label} 必须是数字`);
+    }
+    if ((col.type === 'text' || col.type === 'textarea') && typeof v === 'string' && v.length > MAX_TEXT_LENGTH) {
+      errors.push(`${col.label} 不能超过 ${MAX_TEXT_LENGTH} 个字符（当前 ${v.length}）`);
     }
   }
   return errors;

@@ -56,7 +56,10 @@ app.use(
 
 app.use(express.json({ limit: '10mb' }));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+// app 字段用于让启动脚本确认「端口上的 200 确实来自本系统」，而不是别的 HTTP 服务
+app.get('/api/health', (req, res) =>
+  res.json({ ok: true, app: 'product-ledger', version: 1, time: new Date().toISOString() }),
+);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/tables', tableRoutes);
