@@ -32,10 +32,17 @@ router.post('/', requireAdmin, (req, res) => {
   if (!['admin', 'member'].includes(role)) {
     return res.status(400).json({ message: '角色不合法' });
   }
+  const displayName = String(name ?? '').trim();
+  if (name !== undefined && !displayName) {
+    return res.status(400).json({ message: '姓名不能为空' });
+  }
+  if (displayName.length > 20) {
+    return res.status(400).json({ message: '姓名最多 20 个字' });
+  }
   const user = {
     id: uid('u_'),
     username: uname,
-    name: String(name || uname).trim(),
+    name: displayName || uname,
     passwordHash: bcrypt.hashSync(String(password), BCRYPT_ROUNDS),
     role,
     tokenVersion: 0,
@@ -63,9 +70,11 @@ router.patch('/:id', requireAdmin, (req, res) => {
     if (admins.length <= 1) return res.status(400).json({ message: '至少保留一名管理员' });
   }
   if (name !== undefined) {
+    if (name === null) return res.status(400).json({ message: '姓名不能为空' });
     const next = String(name).trim();
+    if (!next) return res.status(400).json({ message: '姓名不能为空' });
     if (next.length > 20) return res.status(400).json({ message: '姓名最多 20 个字' });
-    if (next) user.name = next;
+    user.name = next;
   }
   if (role) user.role = role;
   if (password) {

@@ -3,8 +3,8 @@ import multer from 'multer';
 import { getDb, saveDbSoon, uid, now } from '../db.js';
 import { requireAuth, logAction } from '../auth.js';
 import { buildWorkbook, parseWorkbook } from '../excel.js';
-import { putSession, getSession } from '../import-sessions.js';
-import { LEDGER_FIELDS } from '../ledger-fields.js';
+import { putSession, getSession, dropSession } from '../import-sessions.js';
+import { LEDGER_FIELDS, LEDGER_WRITABLE_FIELDS } from '../ledger-fields.js';
 import {
   listTables,
   findTableOr404,
@@ -39,7 +39,14 @@ function normalizeColumns(input, prevColumns = []) {
     labels.add(label);
 
     const type = COLUMN_TYPES.some((t) => t.value === c.type) ? c.type : 'text';
-    const prev = prevColumns.find((p) => p.key === c.key);
+    const prevByKey = prevColumns.find((p) => p.key === c.key);
+    const prevByLabel = prevColumns.find((p) => p.label === label);
+    // 已存在的字段只允许改名称/类型，不允许换 key：否则旧 key 会被当成“删除列”，
+    // 行数据被静默清空。客户端漏传 key 时按字段名复用旧 key。
+    if (!prevByKey && prevByLabel && c.key !== undefined && c.key !== null && String(c.key).trim() !== '') {
+      throw new HttpError(400, `字段「${label}」的 key 不允许修改，请删除后重建`);
+    }
+    const prev = prevByKey || prevByLabel;
     let key = typeof c.key === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,40}$/.test(c.key)
       ? c.key
       : prev?.key || uid('f_');
@@ -105,6 +112,34 @@ router.get('/:id', (req, res) => {
   });
 });
 
+/** 列类型/必填/选项变化后，存量数据必须仍然能通过该列的校验 */
+function assertColumnsCompatible(table, nextColumns) {
+  const issues = [];
+  for (const col of nextColumns) {
+    const prev = table.columns.find((c) => c.key === col.key);
+    if (!prev) continue;
+    const typeChanged = prev.type !== col.type;
+    const requiredNow = !prev.required && col.required;
+    const optionsChanged = col.type === 'select'
+      && (prev.options || []).some((o) => !(col.options || []).includes(o));
+    if (!typeChanged && !requiredNow && !optionsChanged) continue;
+    let bad = 0;
+    let sample = '';
+    for (const row of getDb().rows) {
+      if (row.tableId !== table.id) continue;
+      const errors = validateRow({ columns: [col] }, { [col.key]: row.data[col.key] });
+      if (errors.length) {
+        bad += 1;
+        if (!sample) sample = errors[0];
+      }
+    }
+    if (bad) issues.push(`字段「${col.label}」变更后有 ${bad} 行数据不兼容（${sample}）`);
+  }
+  if (issues.length) {
+    throw new HttpError(400, `${issues.join('；')}。请先修正这些数据，或新建字段后迁移。`);
+  }
+}
+
 router.patch('/:id', (req, res) => {
   const table = findTableOr404(req, res);
   if (!table) return;
@@ -124,6 +159,7 @@ router.patch('/:id', (req, res) => {
   if (description !== undefined) table.description = String(description).trim();
   if (columns !== undefined) {
     const cols = normalizeColumns(columns, table.columns);
+    assertColumnsCompatible(table, cols);
     const removed = table.columns.filter((c) => !cols.some((n) => n.key === c.key)).map((c) => c.key);
     table.columns = cols;
     if (removed.length) {
@@ -154,14 +190,18 @@ router.delete('/:id', (req, res) => {
 });
 
 function collectRows(table, query) {
-  const filters = parseFilters(query.filters);
   const keyword = String(query.keyword || '').trim();
   const keys = table.columns.map((c) => c.key);
+  // 排序/筛选字段白名单：只允许本表字段与两个时间戳
+  const sortable = new Set([...keys, '_createdAt', '_updatedAt']);
+  const filters = parseFilters(query.filters, sortable);
   let rows = getDb().rows.filter((r) => r.tableId === table.id);
   if (keyword) rows = rows.filter((r) => matchesKeyword(r.data, keyword, keys));
-  rows = applyFilters(rows, filters, (row, field) => row.data[field]);
-  // 排序字段白名单：只允许本表字段与两个时间戳，非法字段忽略（保持默认顺序）
-  const sortable = new Set([...keys, '_createdAt', '_updatedAt']);
+  rows = applyFilters(rows, filters, (row, field) => {
+    if (field === '_createdAt') return row.createdAt;
+    if (field === '_updatedAt') return row.updatedAt;
+    return row.data[field];
+  });
   const sortBy = sortable.has(String(query.sortBy || '')) ? query.sortBy : undefined;
   return sortRows(rows, sortBy, query.sortOrder, (row, field) => {
     if (field === '_createdAt') return row.createdAt;
@@ -182,7 +222,7 @@ router.get('/:id/rows', (req, res) => {
       ...r,
       createdByName: db.users.find((u) => u.id === r.createdBy)?.name || '—',
       canEdit: canEditRow(req.user, table, r),
-      canDelete: req.user.role === 'admin' || r.createdBy === req.user.id,
+      canDelete: canEditRow(req.user, table, r),
     })),
   });
 });
@@ -195,7 +235,7 @@ router.get('/:id/rows/all', (req, res) => {
     items: rows.map((r) => ({
       ...r,
       canEdit: canEditRow(req.user, table, r),
-      canDelete: req.user.role === 'admin' || r.createdBy === req.user.id,
+      canDelete: canEditRow(req.user, table, r),
     })),
     total: rows.length,
   });
@@ -250,8 +290,8 @@ router.delete('/:id/rows/:rowId', (req, res) => {
   const db = getDb();
   const row = db.rows.find((r) => r.id === req.params.rowId && r.tableId === table.id);
   if (!row) throw new HttpError(404, '数据不存在');
-  if (req.user.role !== 'admin' && row.createdBy !== req.user.id) {
-    throw new HttpError(403, '只能删除自己创建的数据，或联系管理员处理');
+  if (!canEditRow(req.user, table, row)) {
+    throw new HttpError(403, '只能删除自己录入的数据，或联系表格创建者/管理员');
   }
   db.rows = db.rows.filter((r) => r.id !== row.id);
   table.updatedAt = now();
@@ -267,7 +307,7 @@ router.post('/:id/rows/batch-delete', (req, res) => {
   if (!ids.length) throw new HttpError(400, '请选择要删除的数据');
   const db = getDb();
   const target = db.rows.filter((r) => r.tableId === table.id && ids.includes(r.id));
-  const allowed = target.filter((r) => req.user.role === 'admin' || r.createdBy === req.user.id);
+  const allowed = target.filter((r) => canEditRow(req.user, table, r));
   const allowedIds = new Set(allowed.map((r) => r.id));
   db.rows = db.rows.filter((r) => !allowedIds.has(r.id));
   table.updatedAt = now();
@@ -294,8 +334,13 @@ router.post(
     if (!/\.xlsx$/i.test(req.file.originalname)) {
       throw new HttpError(400, '仅支持 .xlsx 格式，请用 Excel 另存为 .xlsx 后重试');
     }
-    const sheets = await parseWorkbook(req.file.buffer);
+    const sheets = await parseWorkbook(req.file.buffer, {
+      expectedLabels: table.columns.map((c) => c.label),
+    });
     if (!sheets.length) throw new HttpError(400, '文件里没有可读取的数据');
+    if (sheets.some((s) => s.truncated)) {
+      throw new HttpError(400, 'Excel 数据超过 5000 行上限，请拆分文件后分批导入');
+    }
     const token = putSession({ sheets, userId: req.user.id, kind: 'table', fileName: req.file.originalname });
     res.json({
       token,
@@ -334,8 +379,8 @@ router.post('/:id/import/commit', (req, res) => {
 
   const session = getSession(token, req.user.id);
   if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
-  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
-  if (!source) throw new HttpError(400, '找不到对应的工作表');
+  const source = session.sheets.find((s) => s.name === sheet);
+  if (!source) throw new HttpError(400, '找不到对应的工作表，请重新上传并选择正确的工作表');
   const dedupeLabel = table.columns.find((c) => c.key === dedupeKey)?.label || '匹配字段';
 
   const db = getDb();
@@ -428,6 +473,8 @@ router.post('/:id/import/commit', (req, res) => {
   table.updatedAt = now();
   saveDbSoon();
   logAction(req.user, '导入 Excel', table.name, `新增 ${inserted} 条，更新 ${updated} 条，失败 ${failed} 条`);
+  // 导入会话只能消费一次，避免重复提交把同一批数据追加多遍
+  dropSession(token);
   res.json({
     inserted,
     updated,
@@ -490,6 +537,10 @@ router.get(
 router.post('/:id/sync-ledger', (req, res) => {
   const table = findTableOr404(req, res);
   if (!table) return;
+  // 同步会写入目标表格的台账关联，必须与修改表格结构同一权限级别
+  if (!canEditTable(req.user, table)) {
+    throw new HttpError(403, '只能同步自己创建的表格，或联系管理员处理');
+  }
   const { rowIds, mapping, scope = 'selected' } = req.body || {};
   // mode 白名单：此前任何非 upsert 的值都会走"直接新增"，可以绕过编号唯一
   const mode = String(req.body?.mode ?? 'upsert').trim().toLowerCase();
@@ -507,7 +558,7 @@ router.post('/:id/sync-ledger', (req, res) => {
   if (!rows.length) throw new HttpError(400, '没有可同步的数据');
 
   const pairs = Object.entries(mapping || {})
-    .filter(([ledgerKey, colKey]) => LEDGER_FIELDS.some((f) => f.key === ledgerKey) && table.columns.some((c) => c.key === colKey));
+    .filter(([ledgerKey, colKey]) => LEDGER_WRITABLE_FIELDS.some((f) => f.key === ledgerKey) && table.columns.some((c) => c.key === colKey));
   if (!pairs.length) throw new HttpError(400, '请至少映射一个台账字段');
   if (!pairs.some(([k]) => k === 'code' || k === 'name')) {
     throw new HttpError(400, '台账同步至少需要映射「产品编号」或「产品名称」');

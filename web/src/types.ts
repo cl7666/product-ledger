@@ -84,6 +84,7 @@ export interface LedgerFieldMeta {
   width?: number;
   options?: string[];
   computed?: boolean;
+  readOnly?: boolean;
 }
 
 export interface SheetInfo {

@@ -452,7 +452,12 @@ export default function TableDetail() {
           <Button icon={<ExportOutlined />} onClick={doExport} disabled={!meta}>
             导出 Excel
           </Button>
-          <Button icon={<SwapOutlined />} onClick={() => setSyncOpen(true)} disabled={!meta || !meta.columns.length}>
+          <Button
+            icon={<SwapOutlined />}
+            onClick={() => setSyncOpen(true)}
+            disabled={!meta || !meta.columns.length || !canEditTable}
+            title={canEditTable ? undefined : '仅表格创建者或管理员可同步到台账'}
+          >
             同步到台账
           </Button>
           <Button icon={<SettingOutlined />} onClick={() => setColModal(true)} disabled={meta?.canEdit === false}>

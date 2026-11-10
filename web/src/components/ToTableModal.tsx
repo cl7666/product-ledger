@@ -29,7 +29,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
       .then(([tablesData, fieldList]) => {
         const eligible = tablesData.items.filter((t) => t.columns.length > 0);
         setTables(eligible);
-        setFields(fieldList.filter((f) => !f.computed));
+        setFields(fieldList.filter((f) => !f.computed && !f.readOnly));
         if (eligible[0]) {
           setTableId(eligible[0].id);
           autoMap(eligible[0], fieldList);
@@ -39,7 +39,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
   }, [open, message]);
 
   const autoMap = (target: DataTable, fieldList: LedgerFieldMeta[]) => {
-    const ledgerKeys = fieldList.filter((f) => !f.computed).map((f) => f.key);
+    const ledgerKeys = fieldList.filter((f) => !f.computed && !f.readOnly).map((f) => f.key);
     const next: Record<string, string> = {};
     for (const col of target.columns) {
       const key = ledgerFieldGuess(col, ledgerKeys);

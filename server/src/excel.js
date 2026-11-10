@@ -33,8 +33,79 @@ function cellText(value) {
   return String(value).trim();
 }
 
-/** 解析上传的 Excel，返回 [{ name, headers, rows: string[][] }] */
-export async function parseWorkbook(buffer, { maxRows = 5000 } = {}) {
+/**
+ * 猜测表头所在行：标题/说明行通常只有一个不同的值（合并单元格会在每列
+ * 重复同一个值），而真正的表头会有多个不同列名。取前 10 行中最先达到
+ * 「不同值数量达到最大值一半」的行，避免把系统导出/模板的标题行当表头。
+ */
+function normalizeLabel(text) {
+  return String(text ?? '')
+    .replace(/[*＊]/g, '')
+    .replace(/[（(][^）)]*[）)]/g, '')
+    .replace(/\s+/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function detectHeaderRow(cleaned, width, expectedLabels = []) {
+  const limit = Math.min(cleaned.length, 10);
+  const stats = [];
+  let maxDistinct = 0;
+  for (let i = 0; i < limit; i += 1) {
+    const values = cleaned[i].map((v) => String(v ?? '').trim()).filter(Boolean);
+    const distinct = new Set(values).size;
+    if (distinct > maxDistinct) maxDistinct = distinct;
+    stats.push({ index: i, distinct, filled: values.length });
+  }
+
+  // 优先用调用方提供的字段名匹配表头：单列表格没有「多列」特征，
+  // 只靠“不同值数量”会把标题误判成表头，字段名匹配可以兜住这种情况。
+  const wanted = [...new Set(expectedLabels.map(normalizeLabel).filter(Boolean))];
+  if (wanted.length) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (const item of stats.slice(0, Math.min(stats.length, 10))) {
+      const cells = cleaned[item.index].map(normalizeLabel).filter(Boolean);
+      let score = 0;
+      for (const cell of cells) {
+        if (wanted.some((w) => w === cell || (cell.length >= 2 && w.includes(cell)) || (w.length >= 2 && cell.includes(w)))) {
+          score += 1;
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = item.index;
+      }
+    }
+    if (bestIndex >= 0 && bestScore >= Math.min(2, wanted.length)) return bestIndex;
+  }
+
+  const minDistinct = Math.max(width > 1 ? 2 : 1, Math.ceil(maxDistinct * 0.5));
+  for (const item of stats) {
+    if (item.distinct < minDistinct) continue;
+    if (width > 1 && item.filled < 2) continue;
+    return item.index;
+  }
+  const fallback = stats.find((item) => item.filled > 0);
+  return fallback ? fallback.index : 0;
+}
+
+/** 导出文件底部的说明/脚注行：通常整行合并，所有单元格是同一段文字 */
+function isFooterNote(row) {
+  const values = row.map((v) => String(v ?? '').trim()).filter(Boolean);
+  if (!values.length || new Set(values).size !== 1) return false;
+  return /^(说明[：:]|本台账由系统自动生成|本表由系统自动生成)/.test(values[0]);
+}
+
+/** 汇总行及之后的内容（合计、导出说明等）属于展示信息，不应作为导入数据 */
+function isSummaryRow(row) {
+  const first = String(row[0] ?? '').trim();
+  // 只认系统生成的「合计（N 条）」，避免把首列恰好以“合计(”开头的数据行当脚注
+  return /^合计[（(]\d+\s*条[）)]/.test(first);
+}
+
+/** 解析上传的 Excel，返回 [{ name, headers, rows: string[][], totalRows, truncated }] */
+export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [] } = {}) {
   const wb = new ExcelJS.Workbook();
   try {
     await wb.xlsx.load(buffer);
@@ -55,11 +126,12 @@ export async function parseWorkbook(buffer, { maxRows = 5000 } = {}) {
     // 去掉整行/整列都为空的数据
     const cleaned = matrix.filter((r) => r.some((c) => c !== ''));
     if (cleaned.length < 1) return;
-    const width = Math.max(...cleaned.map((r) => r.length));
+    const width = cleaned.reduce((max, r) => Math.max(max, r.length), 0);
+    const headerIndex = detectHeaderRow(cleaned, width, expectedLabels);
     const headers = [];
     const seen = new Map();
     for (let i = 0; i < width; i += 1) {
-      let label = (cleaned[0][i] || '').trim() || `第${i + 1}列`;
+      let label = (cleaned[headerIndex][i] || '').trim() || `第${i + 1}列`;
       if (seen.has(label)) {
         const n = seen.get(label) + 1;
         seen.set(label, n);
@@ -69,12 +141,28 @@ export async function parseWorkbook(buffer, { maxRows = 5000 } = {}) {
       }
       headers.push(label);
     }
-    const body = cleaned
-      .slice(1)
-      .filter((r) => r.some((c) => c !== ''))
-      .slice(0, maxRows)
-      .map((r) => Array.from({ length: width }, (_, i) => r[i] ?? ''));
-    sheets.push({ name: ws.name, headers, rows: body, totalRows: body.length });
+    const bodyAll = [];
+    let footer = false;
+    for (let i = headerIndex + 1; i < cleaned.length; i += 1) {
+      const row = cleaned[i];
+      if (!row.some((c) => String(c ?? '').trim() !== '')) continue;
+      if (isSummaryRow(row)) {
+        footer = true;
+        continue;
+      }
+      if (footer) continue;
+      // 说明行只可能出现在文件末尾；中间行即使以“说明：”开头也按数据处理
+      if (i === cleaned.length - 1 && isFooterNote(row)) continue;
+      bodyAll.push(Array.from({ length: width }, (_, ci) => row[ci] ?? ''));
+    }
+    const rows = bodyAll.slice(0, maxRows);
+    sheets.push({
+      name: ws.name,
+      headers,
+      rows,
+      totalRows: bodyAll.length,
+      truncated: bodyAll.length > maxRows,
+    });
   });
   return sheets;
 }
@@ -205,7 +293,8 @@ export async function buildWorkbook({
     const noteRow = ws.getRow(firstDataRow + rows.length + (sumKeys.length && rows.length ? 1 : 0) + 1);
     ws.mergeCells(noteRow.number, 1, noteRow.number, lastCol);
     const cell = noteRow.getCell(1);
-    cell.value = note;
+    // 加「说明：」前缀，导入解析时可以稳定识别并跳过脚注行
+    cell.value = /^说明[：:]/.test(note) ? note : `说明：${note}`;
     cell.font = { name: '微软雅黑', size: 9, italic: true, color: { argb: 'FF8A99A8' } };
     cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
   }

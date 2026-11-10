@@ -40,7 +40,16 @@ export function readLedgerPayload(body, { skipEmpty = false } = {}) {
       if (f.key === 'quantity' && !Number.isInteger(n)) {
         throw new HttpError(400, '「库存数量」必须是整数');
       }
-      payload[f.key] = n;
+      if (f.key === 'price') {
+        // 金额按分计算：单价超过 2 位小数会导致导出的金额与库内金额不一致
+        const rounded = Math.round(n * 100) / 100;
+        if (Math.abs(n - rounded) > 1e-9) {
+          throw new HttpError(400, `「${f.label}」最多保留 2 位小数`);
+        }
+        payload[f.key] = rounded;
+      } else {
+        payload[f.key] = n;
+      }
     } else {
       const text = String(raw ?? '').trim();
       if (text === '' && skipEmpty) continue;

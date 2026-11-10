@@ -3,7 +3,7 @@ import multer from 'multer';
 import { getDb, saveDbSoon, uid, now } from '../db.js';
 import { requireAuth, logAction } from '../auth.js';
 import { buildWorkbook, buildLedgerTemplate, parseWorkbook } from '../excel.js';
-import { putSession, getSession } from '../import-sessions.js';
+import { putSession, getSession, dropSession } from '../import-sessions.js';
 import { LEDGER_FIELDS, LEDGER_WRITABLE_FIELDS, ledgerAmount } from '../ledger-fields.js';
 import { applyFilters, matchesKeyword, paginate, parseFilters, sortRows } from '../query.js';
 import { normalizeRowData, validateRow } from '../store.js';
@@ -36,7 +36,7 @@ function collectLedger(query) {
   if (query.category) rows = rows.filter((r) => r.category === query.category);
   if (query.status) rows = rows.filter((r) => r.status === query.status);
   if (query.warehouse) rows = rows.filter((r) => r.warehouse === query.warehouse);
-  const filters = parseFilters(query.filters);
+  const filters = parseFilters(query.filters, SORT_KEYS);
   rows = applyFilters(rows, filters, (row, field) => (field === 'amount' ? ledgerAmount(row) : row[field]));
   // 排序字段白名单：非法字段回落到默认的"更新时间倒序"
   const sortBy = SORT_KEYS.has(String(query.sortBy || '')) ? query.sortBy : 'updatedAt';
@@ -185,8 +185,13 @@ router.post(
     if (!/\.xlsx$/i.test(req.file.originalname)) {
       throw new HttpError(400, '仅支持 .xlsx 格式，请用 Excel 另存为 .xlsx 后重试');
     }
-    const sheets = await parseWorkbook(req.file.buffer);
+    const sheets = await parseWorkbook(req.file.buffer, {
+      expectedLabels: LEDGER_WRITABLE_FIELDS.map((f) => f.label),
+    });
     if (!sheets.length) throw new HttpError(400, '文件里没有可读取的数据');
+    if (sheets.some((s) => s.truncated)) {
+      throw new HttpError(400, 'Excel 数据超过 5000 行上限，请拆分文件后分批导入');
+    }
     const token = putSession({ sheets, userId: req.user.id, kind: 'ledger', fileName: req.file.originalname });
     res.json({
       token,
@@ -229,12 +234,13 @@ router.post('/import/commit', (req, res) => {
 
   const session = getSession(token, req.user.id);
   if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
-  const source = session.sheets.find((s) => s.name === sheet) || session.sheets[0];
+  const source = session.sheets.find((s) => s.name === sheet);
+  if (!source) throw new HttpError(400, '找不到对应的工作表，请重新上传并选择正确的工作表');
   const db = getDb();
 
   const index = new Map();
   for (const l of db.ledger) {
-    if (dedupeKey === 'code') index.set(String(l.code).toLowerCase(), l);
+    if (dedupeKey === 'code') index.set(String(l.code ?? '').trim().toLowerCase(), l);
   }
   // 追加模式也要知道哪些编号已存在：否则会绕过「编号唯一」不变式，制造重复台账
   const existingCodes = new Set(
@@ -337,13 +343,15 @@ router.post('/import/commit', (req, res) => {
       return;
     }
     db.ledger.push(entry);
-    if (entry.code) index.set(String(entry.code).toLowerCase(), entry);
+    if (entry.code) index.set(String(entry.code).trim().toLowerCase(), entry);
     existingCodes.add(String(entry.code).trim().toLowerCase());
     inserted += 1;
   });
 
   saveDbSoon();
   logAction(req.user, '导入台账 Excel', '台账', `新增 ${inserted} 条，更新 ${updated} 条，失败 ${failed} 条`);
+  // 导入会话只能消费一次：防止网络重试/重复点击把同一批数据写两遍
+  dropSession(token);
   res.json({
     inserted,
     updated,

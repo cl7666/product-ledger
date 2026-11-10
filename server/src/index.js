@@ -101,6 +101,10 @@ app.use((err, req, res, next) => {
   if (err?.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ message: '文件不能超过 20MB' });
   }
+  if (err?.type === 'entity.parse.failed') {
+    // body-parser 的原始报错是英文，直接透传会把内部解析细节暴露给前端
+    return res.status(400).json({ message: '请求体不是合法的 JSON' });
+  }
   const status = err.status || 500;
   if (status >= 500) {
     // 5xx 只写日志，不把内部异常细节返回给客户端

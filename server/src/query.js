@@ -7,7 +7,7 @@ const FILTER_OPS = new Set([
 ]);
 
 /** 非法筛选参数明确报 400，避免静默返回全量数据让用户误以为筛选生效 */
-export function parseFilters(raw) {
+export function parseFilters(raw, allowedFields) {
   if (!raw) return [];
   let arr;
   try {
@@ -16,13 +16,19 @@ export function parseFilters(raw) {
     throw new HttpError(400, '筛选条件不是合法的 JSON');
   }
   if (!Array.isArray(arr)) throw new HttpError(400, '筛选条件必须是数组');
-  return arr
-    .filter((f) => f && typeof f.field === 'string' && f.field)
-    .map((f) => {
-      const op = f.op || 'contains';
-      if (!FILTER_OPS.has(op)) throw new HttpError(400, `不支持的筛选运算符：${op}`);
-      return { ...f, op };
-    });
+  const filters = arr.filter((f) => f && typeof f.field === 'string' && f.field);
+  if (allowedFields) {
+    for (const f of filters) {
+      if (!allowedFields.has(f.field)) {
+        throw new HttpError(400, `筛选字段不存在：${f.field}`);
+      }
+    }
+  }
+  return filters.map((f) => {
+    const op = f.op || 'contains';
+    if (!FILTER_OPS.has(op)) throw new HttpError(400, `不支持的筛选运算符：${op}`);
+    return { ...f, op };
+  });
 }
 
 function asString(v) {

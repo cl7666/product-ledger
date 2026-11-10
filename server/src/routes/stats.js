@@ -23,6 +23,7 @@ router.get('/', (req, res) => {
   }
 
   const lowStock = db.ledger
+    .filter((l) => !['停用', '出库'].includes(l.status))
     .filter((l) => Number(l.quantity) >= 0 && Number(l.quantity) <= 10)
     .sort((a, b) => Number(a.quantity) - Number(b.quantity))
     .slice(0, 6)

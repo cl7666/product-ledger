@@ -125,12 +125,11 @@ export function normalizeRowPatch(table, input) {
   return data;
 }
 
-export function validateRow(table, data, { partial = false } = {}) {
+export function validateRow(table, data) {
   const errors = [];
   for (const col of table.columns) {
     const v = data[col.key];
     const empty = v === undefined || v === null || v === '';
-    if (partial && v === undefined) continue;
     if (col.required && empty) errors.push(`${col.label} 不能为空`);
     if (col.type === 'number' && !empty && typeof v !== 'number') {
       errors.push(`${col.label} 必须是数字`);

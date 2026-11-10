@@ -69,6 +69,9 @@ router.post('/password', requireAuth, (req, res) => {
   if (!bcrypt.compareSync(String(oldPassword), req.user.passwordHash)) {
     return res.status(400).json({ message: '原密码不正确' });
   }
+  if (String(newPassword) === String(oldPassword)) {
+    return res.status(400).json({ message: '新密码不能与原密码相同' });
+  }
   req.user.passwordHash = bcrypt.hashSync(String(newPassword), BCRYPT_ROUNDS);
   req.user.tokenVersion = (req.user.tokenVersion ?? 0) + 1;
   req.user.updatedAt = now();
@@ -84,7 +87,7 @@ router.post('/logout', requireAuth, (req, res) => {
 });
 
 const AVATAR_PATTERN = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
-const MAX_AVATAR_LENGTH = 300 * 1024; // 前端已压缩到 128px，正常 10-30KB
+const MAX_AVATAR_BYTES = 300 * 1024; // 前端已压缩到 128px，正常 10-30KB
 
 /** 自助修改个人资料：姓名、头像（头像为前端压缩后的 data URL） */
 router.patch('/profile', requireAuth, (req, res) => {
@@ -93,6 +96,7 @@ router.patch('/profile', requireAuth, (req, res) => {
     return res.status(400).json({ message: '没有需要修改的内容' });
   }
   if (name !== undefined) {
+    if (name === null) return res.status(400).json({ message: '姓名不能为空' });
     const next = String(name).trim();
     if (!next) return res.status(400).json({ message: '姓名不能为空' });
     if (next.length > 20) return res.status(400).json({ message: '姓名最多 20 个字' });
@@ -106,7 +110,9 @@ router.patch('/profile', requireAuth, (req, res) => {
       if (!AVATAR_PATTERN.test(text)) {
         return res.status(400).json({ message: '头像格式不支持，请上传 PNG / JPG / WebP 图片' });
       }
-      if (text.length > MAX_AVATAR_LENGTH) {
+      // 限制解码后的图片体积，而不是 base64 字符串长度（后者因膨胀会误伤正常图片）
+      const bytes = Buffer.from(text.slice(text.indexOf(',') + 1), 'base64').length;
+      if (bytes > MAX_AVATAR_BYTES) {
         return res.status(400).json({ message: '头像文件过大，请换一张更小的图片' });
       }
       req.user.avatar = text;

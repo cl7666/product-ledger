@@ -269,12 +269,29 @@ async function main() {
     const afterImport = await api(`/tables/${tableId}/rows?pageSize=50`, { token: memberToken });
     check('导入数据已入库', afterImport.data.total === 4, String(afterImport.data.total));
 
-    const dedupe = await api(`/tables/${tableId}/import/commit`, {
+    const replay = await api(`/tables/${tableId}/import/commit`, {
       method: 'POST',
       token: memberToken,
       body: {
         token: preview.data.token,
         sheet: preview.data.sheets[0].name,
+        mapping: { code: 0, name: 1, qty: 2 },
+        mode: 'append',
+      },
+    });
+    check('导入会话提交后立即失效(400)', replay.status === 400, JSON.stringify(replay.data));
+
+    const preview2 = await api(`/tables/${tableId}/import/preview`, {
+      method: 'POST',
+      token: memberToken,
+      body: toForm(xlsx, 'test-dedupe.xlsx'),
+    });
+    const dedupe = await api(`/tables/${tableId}/import/commit`, {
+      method: 'POST',
+      token: memberToken,
+      body: {
+        token: preview2.data.token,
+        sheet: preview2.data.sheets[0].name,
         mapping: { code: 0, name: 1, qty: 2 },
         mode: 'upsert',
         dedupeKey: 'code',
@@ -1258,6 +1275,302 @@ async function main() {
       keepXlsxCommit.data.inserted === 1 && newXlsxAfter.data.items[0]?.price === 0,
       JSON.stringify({ inserted: keepXlsxCommit.data.inserted, price: newXlsxAfter.data.items[0]?.price }),
     );
+    console.log('\n== 17. 回导闭环与新校验 ==');
+
+    // 17.1 系统模板 / 导出的 Excel 必须能被自己正确识别表头并回导
+    const tplRes = await api('/ledger/template', { token: adminToken, raw: true });
+    const tplSheets = await parseWorkbook(Buffer.from(await tplRes.arrayBuffer()));
+    check(
+      '官方模板表头识别正确',
+      tplSheets[0].headers.some((h) => h.includes('产品编号'))
+        && tplSheets[0].headers.some((h) => h.includes('产品名称')),
+      JSON.stringify(tplSheets[0].headers),
+    );
+    check(
+      '官方模板只把示例行当数据',
+      tplSheets[0].totalRows === 1 && tplSheets[0].rows[0].some((v) => String(v).includes('示例')),
+      JSON.stringify({ total: tplSheets[0].totalRows, first: tplSheets[0].rows[0] }),
+    );
+
+    const ledgerAllBefore = await api('/ledger?pageSize=500', { token: adminToken });
+    const ledgerExportRes = await api('/ledger/export', { token: adminToken, raw: true });
+    const ledgerExportSheets = await parseWorkbook(Buffer.from(await ledgerExportRes.arrayBuffer()));
+    check(
+      '台账导出表头识别正确',
+      ledgerExportSheets[0].headers[0] === '序号'
+        && ledgerExportSheets[0].headers.some((h) => h.includes('产品编号')),
+      JSON.stringify(ledgerExportSheets[0].headers),
+    );
+    check(
+      '台账导出回导不把标题/合计/说明当数据',
+      ledgerExportSheets[0].totalRows === ledgerAllBefore.data.total
+        && ledgerExportSheets[0].rows[0][1] === ledgerAllBefore.data.items[0].code,
+      JSON.stringify({
+        parsed: ledgerExportSheets[0].totalRows,
+        expected: ledgerAllBefore.data.total,
+        firstRow: ledgerExportSheets[0].rows[0],
+      }),
+    );
+
+    const productRowsBefore = await api(`/tables/${productTable.id}/rows?pageSize=500`, { token: adminToken });
+    const tableExportRes = await api(`/tables/${productTable.id}/export`, { token: adminToken, raw: true });
+    const tableExportSheets = await parseWorkbook(Buffer.from(await tableExportRes.arrayBuffer()));
+    check(
+      '表格导出表头识别正确',
+      tableExportSheets[0].headers.some((h) => h.includes('产品编号')),
+      JSON.stringify(tableExportSheets[0].headers),
+    );
+    check(
+      '表格导出回导数据行数正确',
+      tableExportSheets[0].totalRows === productRowsBefore.data.total,
+      `${tableExportSheets[0].totalRows} vs ${productRowsBefore.data.total}`,
+    );
+
+    // 单列表格没有「多列」特征，必须依赖字段名匹配表头
+    const oneColTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: { name: '单列表格回导', columns: [{ label: '序列号', type: 'text' }] },
+    });
+    const oneCol = oneColTable.data.table.columns[0];
+    await api(`/tables/${oneColTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken, body: { [oneCol.key]: 'S-1' },
+    });
+    await api(`/tables/${oneColTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken, body: { [oneCol.key]: 'S-2' },
+    });
+    const oneExport = await api(`/tables/${oneColTable.data.table.id}/export`, { token: adminToken, raw: true });
+    const onePreview = await api(`/tables/${oneColTable.data.table.id}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(Buffer.from(await oneExport.arrayBuffer()), 'one.xlsx'),
+    });
+    check(
+      '单列表格导出回导表头正确',
+      onePreview.ok
+        && onePreview.data.sheets[0].headers.includes('序列号')
+        && !onePreview.data.sheets[0].headers.includes('单列表格回导')
+        && onePreview.data.sheets[0].total === 2,
+      JSON.stringify(onePreview.data.sheets?.[0]),
+    );
+
+    // 17.2 导入会话单次消费 + 工作表名必须精确匹配
+    const sessionXlsx = await makeXlsx([
+      ['产品编号', '产品名称', '单价(元)'],
+      ['P-SESSION-1', '会话测试产品', 9.9],
+    ]);
+    const sessionPreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(sessionXlsx, 'session.xlsx'),
+    });
+    const wrongSheet = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: sessionPreview.data.token,
+        sheet: '不存在的工作表',
+        mapping: { code: 0, name: 1 },
+        mode: 'append',
+      },
+    });
+    check(
+      '错误工作表名被拒绝(400)',
+      wrongSheet.status === 400 && /找不到对应的工作表/.test(wrongSheet.data.message || ''),
+      JSON.stringify(wrongSheet.data),
+    );
+    const sessionCommit = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: sessionPreview.data.token,
+        sheet: sessionPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'append',
+      },
+    });
+    check('台账会话首次提交成功', sessionCommit.data.inserted === 1, JSON.stringify(sessionCommit.data));
+    const sessionReplay = await api('/ledger/import/commit', {
+      method: 'POST', token: adminToken,
+      body: {
+        token: sessionPreview.data.token,
+        sheet: sessionPreview.data.sheets[0].name,
+        mapping: { code: 0, name: 1 },
+        mode: 'append',
+      },
+    });
+    check(
+      '台账导入会话提交后立即失效(400)',
+      sessionReplay.status === 400,
+      JSON.stringify(sessionReplay.data),
+    );
+
+    // 17.3 filters 未知字段必须报错，合法时间戳字段仍可用
+    const badLedgerFilter = await api(
+      `/ledger?filters=${encodeURIComponent(JSON.stringify([{ field: 'no_such_field', op: 'eq', value: 'x' }]))}`,
+      { token: adminToken },
+    );
+    check(
+      '台账未知筛选字段返回 400',
+      badLedgerFilter.status === 400 && /筛选字段不存在/.test(badLedgerFilter.data.message || ''),
+      JSON.stringify(badLedgerFilter.data),
+    );
+    const badTableFilter = await api(
+      `/tables/${productTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([{ field: 'no_such_field', op: 'eq', value: 'x' }]))}`,
+      { token: adminToken },
+    );
+    check('表格未知筛选字段返回 400', badTableFilter.status === 400, JSON.stringify(badTableFilter.data));
+    const timeFilter = await api(
+      `/tables/${productTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([{ field: '_updatedAt', op: 'notempty' }]))}`,
+      { token: adminToken },
+    );
+    check('表格时间戳筛选字段可用', timeFilter.ok && timeFilter.data.total > 0, JSON.stringify(timeFilter.data.total));
+
+    // 17.4 单价最多两位小数
+    const badPricePrecision = await api('/ledger', {
+      method: 'POST', token: adminToken,
+      body: { code: 'P-PRICE-BAD', name: '价格精度测试', price: 1.999, quantity: 1 },
+    });
+    check(
+      '单价超过两位小数被拒绝(400)',
+      badPricePrecision.status === 400 && /2 位小数/.test(badPricePrecision.data.message || ''),
+      JSON.stringify(badPricePrecision.data),
+    );
+    const okPrice = await api('/ledger', {
+      method: 'POST', token: adminToken,
+      body: { code: 'P-PRICE-OK', name: '价格精度测试', price: 12.34, quantity: 2 },
+    });
+    check(
+      '两位小数单价正常保存',
+      okPrice.status === 201 && okPrice.data.item.price === 12.34 && okPrice.data.item.amount === 24.68,
+      JSON.stringify(okPrice.data.item),
+    );
+    check(
+      'PATCH 单价精度同样校验(400)',
+      (await api(`/ledger/${okPrice.data.item.id}`, {
+        method: 'PATCH', token: adminToken, body: { price: 1.999 },
+      })).status === 400,
+    );
+
+    // 17.5 修改列类型前必须保证存量数据仍兼容
+    const typeTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: { name: '列类型变更校验表', columns: [{ label: '编号', type: 'text', required: true }] },
+    });
+    const typeCol = typeTable.data.table.columns[0];
+    const typeRow = await api(`/tables/${typeTable.data.table.id}/rows`, {
+      method: 'POST', token: adminToken, body: { [typeCol.key]: 'ABC' },
+    });
+    check('类型变更测试行已创建', typeRow.status === 201, JSON.stringify(typeRow.data));
+    const keyRename = await api(`/tables/${typeTable.data.table.id}`, {
+      method: 'PATCH', token: adminToken,
+      body: { columns: [{ key: 'renamed_key', label: '编号', type: 'text', required: true }] },
+    });
+    check(
+      '已有字段改名 key 被拒绝(400)',
+      keyRename.status === 400 && /key 不允许修改/.test(keyRename.data.message || ''),
+      JSON.stringify(keyRename.data),
+    );
+    const badTypePatch = await api(`/tables/${typeTable.data.table.id}`, {
+      method: 'PATCH', token: adminToken,
+      body: { columns: [{ key: typeCol.key, label: '编号', type: 'number', required: true }] },
+    });
+    check(
+      '文本列改数字列且存量不兼容被拒绝(400)',
+      badTypePatch.status === 400 && /不兼容/.test(badTypePatch.data.message || ''),
+      JSON.stringify(badTypePatch.data),
+    );
+    const goodTypePatch = await api(`/tables/${typeTable.data.table.id}`, {
+      method: 'PATCH', token: adminToken,
+      body: { columns: [{ key: typeCol.key, label: '编号', type: 'text', required: true }] },
+    });
+    check('兼容的列变更仍可保存', goodTypePatch.ok, JSON.stringify(goodTypePatch.data));
+
+    // 17.6 超过 5000 行必须拒绝，而不是静默截断
+    const bigRows = [['编号']];
+    for (let i = 1; i <= 5001; i += 1) bigRows.push([`B-${i}`]);
+    const bigXlsx = await makeXlsx(bigRows);
+    const bigParsed = await parseWorkbook(bigXlsx);
+    check(
+      '解析 5001 行时标记 truncated',
+      bigParsed[0].truncated === true && bigParsed[0].rows.length === 5000 && bigParsed[0].totalRows === 5001,
+      JSON.stringify({ truncated: bigParsed[0].truncated, rows: bigParsed[0].rows.length, total: bigParsed[0].totalRows }),
+    );
+    const bigPreview = await api('/ledger/import/preview', {
+      method: 'POST', token: adminToken, body: toForm(bigXlsx, 'big.xlsx'),
+    });
+    check(
+      '超过 5000 行预览被拒绝(400)',
+      bigPreview.status === 400 && /5000 行/.test(bigPreview.data.message || ''),
+      JSON.stringify(bigPreview.data),
+    );
+
+    // 17.7 非法 JSON 返回中文提示
+    const rawJson = await fetch(`${BASE}/ledger`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+      body: '{"code":',
+    });
+    const rawJsonBody = await rawJson.json().catch(() => ({}));
+    check(
+      '非法 JSON 返回中文 400',
+      rawJson.status === 400 && /合法的 JSON/.test(rawJsonBody.message || ''),
+      JSON.stringify(rawJsonBody),
+    );
+
+    // 17.8 改密不能与旧密码相同；创建用户姓名长度受限
+    const samePassword = await api('/auth/password', {
+      method: 'POST', token: adminToken,
+      body: { oldPassword: 'admin123', newPassword: 'admin123' },
+    });
+    check(
+      '新密码不能与原密码相同(400)',
+      samePassword.status === 400 && /不能与原密码相同/.test(samePassword.data.message || ''),
+      JSON.stringify(samePassword.data),
+    );
+    const emptyName = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'namecheck', password: 'member123', role: 'member', name: '   ' },
+    });
+    check('创建用户空姓名被拒绝(400)', emptyName.status === 400, JSON.stringify(emptyName.data));
+    const longUserName = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'namecheck2', password: 'member123', role: 'member', name: 'x'.repeat(21) },
+    });
+    check('创建用户姓名超长被拒绝(400)', longUserName.status === 400, JSON.stringify(longUserName.data));
+    const namedUser = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: 'namecheck3', password: 'member123', role: 'member', name: ' 名称测试 ' },
+    });
+    check(
+      '创建用户姓名正常保存',
+      namedUser.status === 201 && namedUser.data.user.name === '名称测试',
+      JSON.stringify(namedUser.data),
+    );
+
+    // 17.9 权限矩阵：表主可删表内他人行；成员不能同步他人表；readOnly 字段不可映射
+    const ownerRow = await api(`/tables/${productTable.id}/rows`, {
+      method: 'POST', token: memberToken,
+      body: { code: 'P-OWNER-DEL', name: '表主可删除的行' },
+    });
+    check('成员可向表主表新增行', ownerRow.status === 201, JSON.stringify(ownerRow.data));
+    const ownerDelete = await api(`/tables/${productTable.id}/rows/${ownerRow.data.row.id}`, {
+      method: 'DELETE', token: adminToken,
+    });
+    check('表主可删除他人创建的行', ownerDelete.ok, JSON.stringify(ownerDelete.data));
+
+    const memberSyncOther = await api(`/tables/${productTable.id}/sync-ledger`, {
+      method: 'POST', token: memberToken,
+      body: { scope: 'all', mode: 'insert', mapping: { code: 'code' } },
+    });
+    check(
+      '成员同步他人表格被拒绝(403)',
+      memberSyncOther.status === 403,
+      JSON.stringify(memberSyncOther.data),
+    );
+    const readOnlySync = await api(`/tables/${productTable.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'all', mode: 'insert', mapping: { updatedAt: 'status' } },
+    });
+    check(
+      'readOnly 字段不能作为同步映射(400)',
+      readOnlySync.status === 400,
+      JSON.stringify(readOnlySync.data),
+    );
+
   } finally {
     server.kill();
     await new Promise((r) => setTimeout(r, 300));

@@ -30,10 +30,10 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
     api.ledger
       .fields()
       .then((list) => {
-        setFields(list.filter((f) => !f.computed));
+        setFields(list.filter((f) => !f.computed && !f.readOnly));
         const next: Record<string, string> = {};
         for (const col of table.columns) {
-          const target = ledgerFieldGuess(col, list.filter((f) => !f.computed).map((f) => f.key));
+          const target = ledgerFieldGuess(col, list.filter((f) => !f.computed && !f.readOnly).map((f) => f.key));
           if (target && !next[target]) next[target] = col.key;
         }
         setMapping(next);
@@ -42,7 +42,7 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
       .finally(() => setFetching(false));
   }, [open, table, selectedIds.length, message]);
 
-  const writable = useMemo(() => fields.filter((f) => !f.computed), [fields]);
+  const writable = useMemo(() => fields.filter((f) => !f.computed && !f.readOnly), [fields]);
   const mappedCount = Object.values(mapping).filter(Boolean).length;
   const hasCode = Boolean(mapping.code);
 
@@ -152,7 +152,9 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
 
       <div className="text-muted" style={{ marginTop: 14 }}>
         已映射 {mappedCount} / {writable.length} 个字段。
-        {mode === 'upsert' ? '台账中已存在相同产品编号时将覆盖对应字段。' : '每一行都会新建一条台账记录，可能出现重复编号。'}
+        {mode === 'upsert'
+          ? '台账中已存在相同产品编号时将覆盖对应字段。'
+          : '每一行都会新建一条台账记录；编号重复的行会被跳过，不会生成重复编号。'}
       </div>
     </Modal>
   );
