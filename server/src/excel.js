@@ -47,6 +47,16 @@ function normalizeLabel(text) {
     .toLowerCase();
 }
 
+/** 单列文件常见的“产品清单 / 库存台账”标题行；没有多列特征时用它跳过标题 */
+function looksLikeSingleColumnTitle(values) {
+  if (values.length !== 1) return false;
+  const text = String(values[0] ?? '').trim();
+  return (
+    /^(产品|物料|商品|库存|设备|客户|员工|数据|销售|采购|台账).{0,12}(清单|列表|台账|明细|汇总表|统计表|表)$/.test(text) ||
+    /^(清单|列表|台账|明细|数据表|统计表|模板)$/.test(text)
+  );
+}
+
 function detectHeaderRow(cleaned, width, expectedLabels = []) {
   const limit = Math.min(cleaned.length, 10);
   const stats = [];
@@ -80,6 +90,14 @@ function detectHeaderRow(cleaned, width, expectedLabels = []) {
     if (bestIndex >= 0 && bestScore >= Math.min(2, wanted.length)) return bestIndex;
   }
 
+  if (width === 1) {
+    const nonEmpty = stats.filter((item) => item.filled > 0);
+    if (nonEmpty.length >= 2) {
+      const firstValues = cleaned[nonEmpty[0].index].map((v) => String(v ?? '').trim()).filter(Boolean);
+      if (looksLikeSingleColumnTitle(firstValues)) return nonEmpty[1].index;
+    }
+  }
+
   const minDistinct = Math.max(width > 1 ? 2 : 1, Math.ceil(maxDistinct * 0.5));
   for (const item of stats) {
     if (item.distinct < minDistinct) continue;
@@ -97,11 +115,15 @@ function isFooterNote(row) {
   return /^(说明[：:]|本台账由系统自动生成|本表由系统自动生成)/.test(values[0]);
 }
 
-/** 汇总行及之后的内容（合计、导出说明等）属于展示信息，不应作为导入数据 */
+/** 汇总行（合计）属于展示信息，不应作为导入数据；但后面的数据仍要保留 */
 function isSummaryRow(row) {
   const first = String(row[0] ?? '').trim();
   // 只认系统生成的「合计（N 条）」，避免把首列恰好以“合计(”开头的数据行当脚注
-  return /^合计[（(]\d+\s*条[）)]/.test(first);
+  if (!/^合计[（(]\d+\s*条[）)]/.test(first)) return false;
+  // 真合计行的其余非空单元格都是可求和的数字；数据行即使首列碰巧写成
+  // 「合计（2 条）」，只要后面还有文本，就不能按合计行吞掉。
+  const others = row.slice(1).map((v) => String(v ?? '').replace(/,/g, '').trim()).filter(Boolean);
+  return others.length === 0 || others.every((v) => Number.isFinite(Number(v)));
 }
 
 /** 解析上传的 Excel，返回 [{ name, headers, rows: string[][], totalRows, truncated }] */
@@ -114,13 +136,25 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
     throw new HttpError(400, 'Excel 文件无法解析，请确认是有效的 .xlsx 文件');
   }
   const sheets = [];
+  let sheetCount = 0;
+  let cellCount = 0;
+  const MAX_SHEETS = 20;
+  const MAX_CELLS = 200000;
   wb.eachSheet((ws) => {
+    sheetCount += 1;
+    if (sheetCount > MAX_SHEETS) {
+      throw new HttpError(400, `工作表数量超过上限（${MAX_SHEETS} 个），请拆分文件`);
+    }
     const matrix = [];
     ws.eachRow({ includeEmpty: false }, (row) => {
       const values = [];
       row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
         values[colNumber - 1] = cellText(cell.value);
       });
+      cellCount += values.length;
+      if (cellCount > MAX_CELLS) {
+        throw new HttpError(400, `Excel 单元格数量超过上限（${MAX_CELLS} 个），请拆分文件`);
+      }
       matrix.push(Array.from(values, (v) => (v === undefined ? '' : v)));
     });
     // 去掉整行/整列都为空的数据
@@ -142,15 +176,12 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
       headers.push(label);
     }
     const bodyAll = [];
-    let footer = false;
     for (let i = headerIndex + 1; i < cleaned.length; i += 1) {
       const row = cleaned[i];
       if (!row.some((c) => String(c ?? '').trim() !== '')) continue;
-      if (isSummaryRow(row)) {
-        footer = true;
-        continue;
-      }
-      if (footer) continue;
+      // 只跳过合计行本身。合计行之后可能还有真实数据（手工追加在合计下方），
+      // 不能因为出现一次“合计（N 条）”就把后续行全部丢弃。
+      if (isSummaryRow(row)) continue;
       // 说明行只可能出现在文件末尾；中间行即使以“说明：”开头也按数据处理
       if (i === cleaned.length - 1 && isFooterNote(row)) continue;
       bodyAll.push(Array.from({ length: width }, (_, ci) => row[ci] ?? ''));
@@ -161,10 +192,39 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
       headers,
       rows,
       totalRows: bodyAll.length,
+      // 数据第一行在 Excel 中的 1-based 行号，用于把错误定位到用户看到的行
+      dataStartRow: headerIndex + 2,
       truncated: bodyAll.length > maxRows,
     });
   });
   return sheets;
+}
+
+/**
+ * 把 YYYY-MM-DD / YYYY-MM-DD HH:mm:ss 转成 Excel 可识别的日期。
+ * 按 UTC 分量构造，避免导出机器的时区把日期整体前移/后移一天。
+ */
+function toExcelDate(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  let m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    return Number.isNaN(d.getTime()) ? null : { value: d, numFmt: 'yyyy-mm-dd' };
+  }
+  m = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (m) {
+    const d = new Date(Date.UTC(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6] || 0),
+    ));
+    return Number.isNaN(d.getTime()) ? null : { value: d, numFmt: 'yyyy-mm-dd hh:mm:ss' };
+  }
+  return null;
 }
 
 /**
@@ -237,11 +297,27 @@ export async function buildWorkbook({
       const cell = r.getCell(ci + 1);
       const value = row[col.key];
       if (col.type === 'number' || col.type === 'computed') {
-        cell.value = value === null || value === undefined || value === '' ? null : Number(value);
-        cell.numFmt = col.precision === 0 ? '#,##0' : '#,##0.00';
+        if (value === null || value === undefined || value === '') {
+          cell.value = null;
+        } else {
+          const n = Number(String(value).replace(/,/g, ''));
+          if (Number.isFinite(n)) {
+            cell.value = n;
+            cell.numFmt = col.precision === 0 ? '#,##0' : '#,##0.00';
+          } else {
+            // 历史脏数据（number 列里存了 "abc"）原样导出，不能变成 NaN
+            cell.value = String(value);
+          }
+        }
         cell.alignment = { horizontal: 'right', vertical: 'middle' };
       } else if (col.type === 'date') {
-        cell.value = value ? String(value).replace('T', ' ').slice(0, 19) : '';
+        const parsed = toExcelDate(value);
+        if (parsed) {
+          cell.value = parsed.value;
+          cell.numFmt = parsed.numFmt;
+        } else {
+          cell.value = value ? String(value) : '';
+        }
         cell.alignment = { horizontal: 'center', vertical: 'middle' };
       } else {
         cell.value = value ?? '';

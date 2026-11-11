@@ -56,6 +56,19 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
       message.error('“存在则更新”模式必须映射「产品编号」字段');
       return;
     }
+    if (scope === 'all') {
+      const confirmed = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: '确认同步全部数据？',
+          content: `将把「${table.name}」中全部 ${table.rowCount ?? ''} 行同步到产品台账，可能覆盖已有台账记录。`,
+          okText: '继续同步',
+          cancelText: '取消',
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!confirmed) return;
+    }
     setLoading(true);
     try {
       const res = await api.tables.syncLedger(table.id, {

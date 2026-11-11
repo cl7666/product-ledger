@@ -220,8 +220,15 @@ router.post('/import/commit', (req, res) => {
   if (!['append', 'upsert'].includes(mode)) {
     throw new HttpError(400, '导入方式只能是 append（追加）或 upsert（按编号匹配更新）');
   }
+  // 空字符串/空白/负数/小数都不是合法列号；Number('') === 0 会把未映射列悄悄指到第一列
+  const toIndex = (value) => {
+    if (typeof value === 'number') return value;
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) return NaN;
+    return Number(text);
+  };
   const pairs = Object.entries(mapping || {})
-    .map(([field, index]) => [field, Number(index)])
+    .map(([field, index]) => [field, toIndex(index)])
     .filter(([field, idx]) => LEDGER_WRITABLE_FIELDS.some((f) => f.key === field) && Number.isInteger(idx) && idx >= 0);
   if (!pairs.length) throw new HttpError(400, '请至少映射一个台账字段');
   // upsert 必须真正拿到编号，否则会把"更新"静默降级成"全部新增"
@@ -236,6 +243,11 @@ router.post('/import/commit', (req, res) => {
   if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
   const source = session.sheets.find((s) => s.name === sheet);
   if (!source) throw new HttpError(400, '找不到对应的工作表，请重新上传并选择正确的工作表');
+  if (pairs.some(([, idx]) => idx >= source.headers.length)) {
+    throw new HttpError(400, '映射的列超出了该工作表的表头范围，请重新上传并选择正确的工作表');
+  }
+  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2
+  const dataStartRow = Number.isInteger(source.dataStartRow) && source.dataStartRow > 0 ? source.dataStartRow : 2;
   const db = getDb();
 
   const index = new Map();
@@ -269,7 +281,7 @@ router.post('/import/commit', (req, res) => {
     });
     if (badNumber) {
       const f = LEDGER_WRITABLE_FIELDS.find((x) => x.key === badNumber[0]);
-      fail(i + 2, `「${f.label}」不是有效数字：${cells[badNumber[1]]}`);
+      fail(dataStartRow + i, `「${f.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     let clean;
@@ -278,18 +290,18 @@ router.post('/import/commit', (req, res) => {
       // 新增分支的默认值在下方 entry 构造时兜底，行为不变
       clean = readLedgerPayload(payload, { skipEmpty: mode === 'upsert' });
     } catch (err) {
-      fail(i + 2, err.message || '数据格式不正确');
+      fail(dataStartRow + i, err.message || '数据格式不正确');
       return;
     }
     if (!clean.name && !clean.code) {
-      fail(i + 2, '产品名称与产品编号均为空');
+      fail(dataStartRow + i, '产品名称与产品编号均为空');
       return;
     }
     // 追加模式不覆盖已有记录；编号已存在时按行失败，避免绕过「编号唯一」制造重复台账
     if (mode === 'append' && clean.code) {
       const key = clean.code.trim().toLowerCase();
       if (existingCodes.has(key)) {
-        fail(i + 2, `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`);
+        fail(dataStartRow + i, `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`);
         return;
       }
     }
@@ -297,19 +309,19 @@ router.post('/import/commit', (req, res) => {
       const key = String(clean.code || '').trim().toLowerCase();
       // 编号为空时不能匹配，也不能静默降级成"新增 AUTO 编号"
       if (!key) {
-        fail(i + 2, '产品编号为空，无法按编号匹配更新');
+        fail(dataStartRow + i, '产品编号为空，无法按编号匹配更新');
         return;
       }
       const found = index.get(key);
       if (found) {
         if (!canEditLedger(req.user, found)) {
-          fail(i + 2, '无权覆盖他人录入的台账，可联系管理员处理');
+          fail(dataStartRow + i, '无权覆盖他人录入的台账，可联系管理员处理');
           return;
         }
         try {
           validateLedgerEntry({ ...found, ...clean });
         } catch (err) {
-          fail(i + 2, err.message);
+          fail(dataStartRow + i, err.message);
           return;
         }
         Object.assign(found, clean, { updatedAt: now(), updatedBy: req.user.id });
@@ -339,7 +351,7 @@ router.post('/import/commit', (req, res) => {
     try {
       validateLedgerEntry(entry);
     } catch (err) {
-      fail(i + 2, err.message);
+      fail(dataStartRow + i, err.message);
       return;
     }
     db.ledger.push(entry);

@@ -10,6 +10,8 @@ export const DB_FILE = process.env.DB_FILE
   ? path.resolve(ROOT_DIR, process.env.DB_FILE)
   : path.join(DATA_DIR, 'db.json');
 
+export const CURRENT_DB_VERSION = 1;
+
 function emptyDb() {
   return {
     users: [],
@@ -17,7 +19,31 @@ function emptyDb() {
     rows: [],
     ledger: [],
     logs: [],
-    meta: { version: 1, createdAt: new Date().toISOString() },
+    meta: { version: CURRENT_DB_VERSION, createdAt: new Date().toISOString() },
+  };
+}
+
+/**
+ * 升级/校验数据文件版本。只做结构层面的迁移，不猜测业务数据含义：
+ * 版本 0（早期没有 meta.version）补成 1；高于当前程序支持的版本直接拒绝启动，
+ * 防止旧程序写坏新版本数据。
+ */
+function migrateDb(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('数据库根节点必须是 JSON 对象');
+  }
+  const rawMeta = raw.meta && typeof raw.meta === 'object' && !Array.isArray(raw.meta) ? raw.meta : {};
+  const version = rawMeta.version === undefined ? 0 : Number(rawMeta.version);
+  if (!Number.isInteger(version) || version < 0) {
+    throw new Error(`数据库版本号无效：${String(rawMeta.version)}`);
+  }
+  if (version > CURRENT_DB_VERSION) {
+    throw new Error(`数据库版本 ${version} 高于当前程序支持的版本 ${CURRENT_DB_VERSION}，请升级程序后再启动`);
+  }
+  return {
+    ...emptyDb(),
+    ...raw,
+    meta: { ...emptyDb().meta, ...rawMeta, version: CURRENT_DB_VERSION },
   };
 }
 
@@ -27,15 +53,18 @@ let saveTimer = null;
 export function loadDb() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (fs.existsSync(DB_FILE)) {
+    let raw;
     try {
-      const raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-      db = { ...emptyDb(), ...raw };
+      raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     } catch (err) {
+      // 只有 JSON 语法错误才按“文件损坏”备份；版本/结构错误必须让用户看到并恢复
       const backup = `${DB_FILE}.corrupt-${Date.now()}`;
       fs.copyFileSync(DB_FILE, backup);
       console.error(`[db] 数据文件损坏，已备份到 ${backup}，使用空数据库启动：`, err.message);
       db = emptyDb();
+      return db;
     }
+    db = migrateDb(raw);
   }
   return db;
 }

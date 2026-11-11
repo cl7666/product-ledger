@@ -7,7 +7,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
-import { parseWorkbook } from '../src/excel.js';
+import { buildWorkbook, parseWorkbook } from '../src/excel.js';
+import { putSession } from '../src/import-sessions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -77,7 +78,7 @@ async function main() {
 
   const server = spawn(process.execPath, ['src/index.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), DB_FILE: TEST_DB },
+    env: { ...process.env, PORT: String(PORT), DB_FILE: TEST_DB, SEED_DEMO: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logs = [];
@@ -1570,6 +1571,218 @@ async function main() {
       readOnlySync.status === 400,
       JSON.stringify(readOnlySync.data),
     );
+
+    console.log('\n== 18. 本轮修复专项 ==');
+    // 18.1 合计行后面的真实数据不能被整段吞掉；单列标题行要能跳过
+    const afterSummary = await parseWorkbook(await makeXlsx([
+      ['产品名称', '数量'],
+      ['A', '1'],
+      ['合计（1 条）', '1'],
+      ['B', '2'],
+    ]));
+    check(
+      '合计行后的数据仍被保留',
+      afterSummary[0].rows.length === 2 && afterSummary[0].rows[1][0] === 'B',
+      JSON.stringify(afterSummary[0].rows),
+    );
+    const singleTitle = await parseWorkbook(await makeXlsx([
+      ['产品清单'],
+      ['SKU'],
+      ['P-1'],
+      ['P-2'],
+    ]), { expectedLabels: ['产品编号'] });
+    check(
+      '单列文件跳过清单标题',
+      singleTitle[0].headers[0] === 'SKU' && singleTitle[0].rows.length === 2,
+      JSON.stringify({ headers: singleTitle[0].headers, rows: singleTitle[0].rows }),
+    );
+
+    // 18.2 表格导入 upsert：空单元格不得清空已有值
+    const fixTableRes = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '导入空值语义测试',
+        columns: [
+          { label: '编号', type: 'text', required: true },
+          { label: '名称', type: 'text' },
+          { label: '数量', type: 'number' },
+        ],
+      },
+    });
+    const fixTable = fixTableRes.data.table;
+    const [fixCode, fixName, fixQty] = fixTable.columns;
+    await api(`/tables/${fixTable.id}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { [fixCode.key]: 'C', [fixName.key]: 'Gamma', [fixQty.key]: 5 },
+    });
+    const emptyUpsertXlsx = await makeXlsx([
+      ['产品清单'],
+      ['编号', '名称', '数量'],
+      ['C', '', ''],
+    ]);
+    const emptyUpsertPreview = await api(`/tables/${fixTable.id}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(emptyUpsertXlsx, 'empty-upsert.xlsx'),
+    });
+    const emptyUpsertCommit = await api(`/tables/${fixTable.id}/import/commit`, {
+      method: 'POST', token: adminToken,
+      body: {
+        token: emptyUpsertPreview.data.token,
+        sheet: emptyUpsertPreview.data.sheets[0].name,
+        mode: 'upsert',
+        dedupeKey: fixCode.key,
+        mapping: { [fixCode.key]: 0, [fixName.key]: 1, [fixQty.key]: 2 },
+      },
+    });
+    const keptRows = await api(`/tables/${fixTable.id}/rows?keyword=${encodeURIComponent('C')}`, { token: adminToken });
+    const kept = keptRows.data.items.find((r) => r.data[fixCode.key] === 'C');
+    check(
+      '导入 upsert 空单元格保留已有值',
+      emptyUpsertCommit.data.updated === 1 && kept?.data[fixName.key] === 'Gamma' && kept?.data[fixQty.key] === 5,
+      JSON.stringify({ result: emptyUpsertCommit.data, row: kept?.data }),
+    );
+
+    // 18.3 错误行号要按真实表头偏移；空 mapping / 越界 mapping 都要 400
+    const errTableRes = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '导入行号测试',
+        columns: [
+          { label: '编号', type: 'text', required: true },
+          { label: '名称', type: 'text' },
+        ],
+      },
+    });
+    const errTable = errTableRes.data.table;
+    const [errCode, errName] = errTable.columns;
+    const errXlsx = await makeXlsx([
+      ['产品清单'],
+      ['编号', '名称'],
+      ['', '缺编号'],
+    ]);
+    const errPreview = await api(`/tables/${errTable.id}/import/preview`, {
+      method: 'POST', token: adminToken, body: toForm(errXlsx, 'row-number.xlsx'),
+    });
+    const errCommit = await api(`/tables/${errTable.id}/import/commit`, {
+      method: 'POST', token: adminToken,
+      body: {
+        token: errPreview.data.token,
+        sheet: errPreview.data.sheets[0].name,
+        mapping: { [errCode.key]: 0, [errName.key]: 1 },
+        mode: 'append',
+      },
+    });
+    check(
+      '导入错误行号带表头偏移',
+      errCommit.data.failed === 1 && errCommit.data.errors?.[0]?.row === 3,
+      JSON.stringify(errCommit.data),
+    );
+    const emptyMapping = await api(`/tables/${errTable.id}/import/commit`, {
+      method: 'POST', token: adminToken,
+      body: { token: 'none', sheet: 'none', mapping: { [errCode.key]: '' }, mode: 'append' },
+    });
+    check('空 mapping 被拒绝(400)', emptyMapping.status === 400, JSON.stringify(emptyMapping.data));
+
+    // 18.4 非法同步范围必须拒绝，不能静默等同“全部”
+    const badScope = await api(`/tables/${productTable.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'bogus-scope', mode: 'insert', mapping: { code: 'code' } },
+    });
+    check('非法同步范围被拒绝(400)', badScope.status === 400, JSON.stringify(badScope.data));
+
+    // 18.5 日期筛选 gt / between
+    const dateTableRes = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '日期筛选测试',
+        columns: [
+          { label: '日期', type: 'date' },
+          { label: '名称', type: 'text' },
+        ],
+      },
+    });
+    const dateTable = dateTableRes.data.table;
+    const [dateCol, dateName] = dateTable.columns;
+    await api(`/tables/${dateTable.id}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { [dateCol.key]: '2026-01-01', [dateName.key]: '一月' },
+    });
+    await api(`/tables/${dateTable.id}/rows`, {
+      method: 'POST', token: adminToken,
+      body: { [dateCol.key]: '2026-02-01', [dateName.key]: '二月' },
+    });
+    const dateGt = await api(`/tables/${dateTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([
+      { field: dateCol.key, op: 'gt', value: '2026-01-15' },
+    ]))}`, { token: adminToken });
+    const dateBetween = await api(`/tables/${dateTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([
+      { field: dateCol.key, op: 'between', value: ['2026-01-01', '2026-01-31'] },
+    ]))}`, { token: adminToken });
+    check('日期 gt 筛选生效', dateGt.data.total === 1, String(dateGt.data.total));
+    check('日期 between 筛选生效', dateBetween.data.total === 1, String(dateBetween.data.total));
+
+    // 18.6 导出：非法数字原样成文本，日期写成 Excel 日期
+    const exportCheck = await buildWorkbook({
+      columns: [
+        { key: 'd', label: '日期', type: 'date' },
+        { key: 'n', label: '数量', type: 'number', precision: 0 },
+      ],
+      rows: [{ d: '2026-01-02', n: 'abc' }],
+      title: '导出格式测试',
+    });
+    const exportCheckWb = new ExcelJS.Workbook();
+    await exportCheckWb.xlsx.load(exportCheck);
+    const exportCheckWs = exportCheckWb.worksheets[0];
+    check(
+      '日期导出为 Excel 日期',
+      exportCheckWs.getCell('A4').value instanceof Date && /yyyy-mm-dd/.test(String(exportCheckWs.getCell('A4').numFmt)),
+      JSON.stringify({ value: exportCheckWs.getCell('A4').value, fmt: exportCheckWs.getCell('A4').numFmt }),
+    );
+    check(
+      '非法数字导出为文本而非 NaN',
+      exportCheckWs.getCell('B4').value === 'abc',
+      JSON.stringify(exportCheckWs.getCell('B4').value),
+    );
+
+    // 18.7 multer 字段错误返回 400 而非 500
+    const wrongForm = new FormData();
+    wrongForm.append('wrong', new Blob([Buffer.from('x')]), 'wrong.xlsx');
+    const wrongField = await api(`/tables/${fixTable.id}/import/preview`, {
+      method: 'POST', token: adminToken, body: wrongForm,
+    });
+    check('multer 字段名错误返回 400', wrongField.status === 400, JSON.stringify(wrongField.data));
+
+    // 18.8 logout 后旧 token 失效；超长登录参数被拒绝
+    const logoutName = `logout_${Date.now()}`;
+    const logoutUserRes = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: logoutName, password: 'member123', role: 'member' },
+    });
+    check('创建登出测试用户', logoutUserRes.status === 201, JSON.stringify(logoutUserRes.data));
+    const loginRes = await api('/auth/login', {
+      method: 'POST', body: { username: logoutName, password: 'member123' },
+    });
+    const userToken = loginRes.data.token;
+    await api('/auth/logout', { method: 'POST', token: userToken });
+    const meAfterLogout = await api('/auth/me', { token: userToken });
+    check('logout 后旧 token 失效(401)', meAfterLogout.status === 401, JSON.stringify(meAfterLogout.data));
+    const longLogin = await api('/auth/login', {
+      method: 'POST',
+      body: { username: 'u'.repeat(65), password: 'p'.repeat(201) },
+    });
+    check('超长登录参数被拒绝(400)', longLogin.status === 400, JSON.stringify(longLogin.data));
+
+    // 18.9 导入会话按解析后的字节数限额，避免 50 个大会话撑爆内存
+    let sessionError = null;
+    try {
+      putSession({
+        userId: 'u_session_limit',
+        kind: 'test',
+        fileName: 'big.xlsx',
+        sheets: [{ name: 'S', headers: ['X'], rows: [['x'.repeat(9 * 1024 * 1024)]] }],
+      });
+    } catch (err) {
+      sessionError = err;
+    }
+    check('导入会话字节上限生效(413)', sessionError?.status === 413, JSON.stringify(sessionError?.message));
 
   } finally {
     server.kill();

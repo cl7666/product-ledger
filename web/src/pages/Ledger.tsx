@@ -318,7 +318,7 @@ export default function Ledger() {
             type="link"
             size="small"
             disabled={row.canEdit === false}
-            title={row.canEdit === false ? '只能修改自己录入的台账' : undefined}
+            title={row.canEdit === false ? '仅录入者或管理员可修改' : undefined}
             onClick={() => openEdit(row)}
           >
             编辑

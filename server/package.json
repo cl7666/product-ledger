@@ -7,6 +7,7 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js --app product-ledger",
     "seed": "node src/seed.js",
+    "seed:force": "node src/seed.js --force",
     "test:api": "node test/api.test.js"
   },
   "dependencies": {

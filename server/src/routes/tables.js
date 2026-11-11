@@ -365,8 +365,15 @@ router.post('/:id/import/commit', (req, res) => {
   if (!['append', 'upsert'].includes(mode)) {
     throw new HttpError(400, '导入方式只能是 append（追加）或 upsert（按字段匹配更新）');
   }
+  // 空字符串/空白/负数/小数都不是合法列号；Number('') === 0 会把未映射列悄悄指到第一列
+  const toIndex = (value) => {
+    if (typeof value === 'number') return value;
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) return NaN;
+    return Number(text);
+  };
   const pairs = Object.entries(mapping || {})
-    .map(([colKey, headerIndex]) => [colKey, Number(headerIndex)])
+    .map(([colKey, headerIndex]) => [colKey, toIndex(headerIndex)])
     .filter(([colKey, idx]) => table.columns.some((c) => c.key === colKey) && Number.isInteger(idx) && idx >= 0);
   if (!pairs.length) throw new HttpError(400, '请至少映射一个字段');
   // upsert 必须有匹配字段，且该字段要真的参与映射；否则 existing 永远为空，会静默退化成全部新增
@@ -381,6 +388,11 @@ router.post('/:id/import/commit', (req, res) => {
   if (!session) throw new HttpError(400, '导入会话已过期，请重新上传文件');
   const source = session.sheets.find((s) => s.name === sheet);
   if (!source) throw new HttpError(400, '找不到对应的工作表，请重新上传并选择正确的工作表');
+  if (pairs.some(([, idx]) => idx >= source.headers.length)) {
+    throw new HttpError(400, '映射的列超出了该工作表的表头范围，请重新上传并选择正确的工作表');
+  }
+  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2
+  const dataStartRow = Number.isInteger(source.dataStartRow) && source.dataStartRow > 0 ? source.dataStartRow : 2;
   const dedupeLabel = table.columns.find((c) => c.key === dedupeKey)?.label || '匹配字段';
 
   const db = getDb();
@@ -405,7 +417,14 @@ router.post('/:id/import/commit', (req, res) => {
   source.rows.forEach((cells, index) => {
     if (!cells.some((c) => String(c ?? '').trim() !== '')) return;
     const input = {};
-    for (const [colKey, idx] of pairs) input[colKey] = cells[idx] ?? '';
+    const patchInput = {};
+    for (const [colKey, idx] of pairs) {
+      const value = cells[idx] ?? '';
+      input[colKey] = value;
+      // upsert 的空单元格表示“不修改”，与台账导入/表格同步语义一致；
+      // append 仍保留空值，由 normalizeRowData 落成默认值。
+      if (mode !== 'upsert' || String(value ?? '').trim() !== '') patchInput[colKey] = value;
+    }
     // 数字列：Excel 里填了非数字内容时明确报错，避免静默丢数据
     const badNumber = pairs.find(([colKey, idx]) => {
       const col = table.columns.find((c) => c.key === colKey);
@@ -414,7 +433,7 @@ router.post('/:id/import/commit', (req, res) => {
     });
     if (badNumber) {
       const col = table.columns.find((c) => c.key === badNumber[0]);
-      fail(index + 2, `「${col.label}」不是有效数字：${cells[badNumber[1]]}`);
+      fail(dataStartRow + index, `「${col.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     if (mode === 'upsert' && dedupeKey) {
@@ -422,22 +441,22 @@ router.post('/:id/import/commit', (req, res) => {
       const normalizedKey = normalizeRowPatch(table, { [dedupeKey]: input[dedupeKey] })[dedupeKey];
       const key = String(normalizedKey ?? '').trim().toLowerCase();
       if (!key) {
-        fail(index + 2, `「${dedupeLabel}」为空，无法判断是否与已有数据重复`);
+        fail(dataStartRow + index, `「${dedupeLabel}」为空，无法判断是否与已有数据重复`);
         return;
       }
       if (existing.has(key)) {
         const target = existing.get(key);
         // 行级权限：与单条 PATCH 保持一致，导入也不能覆盖别人录入的数据
         if (!canEditRow(req.user, table, target)) {
-          fail(index + 2, '无权覆盖他人录入的数据，可联系表格创建者或管理员处理');
+          fail(dataStartRow + index, '无权覆盖他人录入的数据，可联系表格创建者或管理员处理');
           return;
         }
-        // 只合并"本次实际映射的列"：未映射列保持原值，不能被空串/null 覆盖
-        const patch = normalizeRowPatch(table, input);
+        // 只合并"本次实际映射且非空"的列：未映射列和空单元格都保持原值
+        const patch = normalizeRowPatch(table, patchInput);
         const merged = { ...target.data, ...patch };
         const mergedErrors = validateRow(table, merged);
         if (mergedErrors.length) {
-          fail(index + 2, mergedErrors.join('；'));
+          fail(dataStartRow + index, mergedErrors.join('；'));
           return;
         }
         target.data = merged;
@@ -450,7 +469,7 @@ router.post('/:id/import/commit', (req, res) => {
     const data = normalizeRowData(table, input);
     const rowErrors = validateRow(table, data);
     if (rowErrors.length) {
-      fail(index + 2, rowErrors.join('；'));
+      fail(dataStartRow + index, rowErrors.join('；'));
       return;
     }
     const row = {
@@ -547,10 +566,15 @@ router.post('/:id/sync-ledger', (req, res) => {
   if (!['upsert', 'insert'].includes(mode)) {
     throw new HttpError(400, '同步方式只能是 upsert（按编号更新）或 insert（总是新增）');
   }
+  // scope 白名单：此前任意非 selected 值都等同 all，一个拼写错误就会同步整张表
+  const scopeKey = String(scope ?? 'selected').trim().toLowerCase();
+  if (!['selected', 'all'].includes(scopeKey)) {
+    throw new HttpError(400, '同步范围只能是 selected（选中行）或 all（全部行）');
+  }
   const db = getDb();
 
   let rows = db.rows.filter((r) => r.tableId === table.id);
-  if (scope === 'selected') {
+  if (scopeKey === 'selected') {
     if (!Array.isArray(rowIds) || !rowIds.length) throw new HttpError(400, '请选择要同步的数据');
     const set = new Set(rowIds);
     rows = rows.filter((r) => set.has(r.id));

@@ -62,13 +62,15 @@ export default function ColumnManagerModal({ open, columns, rowCount, onCancel, 
     });
   };
 
-  const doSave = async () => {
+  const doSave = async (): Promise<boolean> => {
     setSaving(true);
     try {
       await onSave(cols);
       onCancel();
+      return true;
     } catch (err) {
       message.error((err as Error).message);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -104,7 +106,11 @@ export default function ColumnManagerModal({ open, columns, rowCount, onCancel, 
         okText: '确认删除',
         okButtonProps: { danger: true },
         cancelText: '取消',
-        onOk: doSave,
+        onOk: async () => {
+          const ok = await doSave();
+          // 保存失败时 reject，antd 会保持确认框打开，避免用户以为字段已保存
+          if (!ok) throw new Error('保存失败');
+        },
       });
       return;
     }

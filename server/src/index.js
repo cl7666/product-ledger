@@ -14,10 +14,39 @@ import { seed } from './seed.js';
 
 const PORT = Number(process.env.PORT) || 4399;
 
-loadDb();
-if (!getDb().users.length) {
-  seed();
-  console.log('[seed] 检测到空数据库，已写入演示数据');
+try {
+  loadDb();
+} catch (err) {
+  console.error(`[db] 启动失败：${err.message}`);
+  console.error('[db] 请恢复 db.json 或升级程序；为避免覆盖数据，服务已停止。');
+  process.exit(1);
+}
+
+// 启动时只允许在「完全空库」且显式开启 SEED_DEMO 的情况下写入演示数据。
+// 用户为空但业务数据还在，通常意味着 db.json 被改坏或误删了 users，
+// 此时绝不能重新 seed（seed 会 resetDb，导致整库数据被演示数据覆盖）。
+const COLLECTIONS = ['users', 'tables', 'rows', 'ledger', 'logs'];
+const malformed = COLLECTIONS.filter((key) => !Array.isArray(getDb()[key]));
+if (malformed.length) {
+  console.error(`[db] 数据文件结构异常：${malformed.join('、')} 不是数组。为防止覆盖数据，服务已停止。`);
+  process.exit(1);
+}
+
+const startupDb = getDb();
+const hasBusinessData = ['tables', 'rows', 'ledger', 'logs'].some((key) => startupDb[key].length > 0);
+if (!startupDb.users.length && hasBusinessData) {
+  console.error('[db] 检测到用户数据为空，但表格/台账/日志仍有数据，已拒绝自动初始化演示数据。');
+  console.error('[db] 请从备份恢复 db.json；如确认这些数据可以丢弃，请执行 npm run seed:force。');
+  process.exit(1);
+}
+
+if (!startupDb.users.length && !hasBusinessData) {
+  if (process.env.SEED_DEMO === '1') {
+    seed();
+    console.log('[seed] 已按 SEED_DEMO=1 写入演示数据');
+  } else {
+    console.warn('[seed] 数据库为空，未自动写入演示数据；首次使用请先执行 npm run seed。');
+  }
 }
 
 const app = express();
@@ -54,12 +83,46 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
+
+// 可选访问日志：默认关闭，ACCESS_LOG=1 时输出一行 JSON，便于接入日志采集。
+app.use((req, res, next) => {
+  if (process.env.ACCESS_LOG !== '1') return next();
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    console.log(JSON.stringify({
+      at: new Date().toISOString(),
+      level: 'info',
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - startedAt,
+      ip: req.ip,
+    }));
+  });
+  next();
+});
 
 // app 字段用于让启动脚本确认「端口上的 200 确实来自本系统」，而不是别的 HTTP 服务
-app.get('/api/health', (req, res) =>
-  res.json({ ok: true, app: 'product-ledger', version: 1, time: new Date().toISOString() }),
-);
+app.get('/api/health', (req, res) => {
+  const db = getDb();
+  const memory = process.memoryUsage();
+  res.json({
+    ok: true,
+    app: 'product-ledger',
+    version: 1,
+    time: new Date().toISOString(),
+    uptime: Math.round(process.uptime()),
+    db: {
+      version: db.meta?.version ?? 0,
+      users: db.users?.length ?? 0,
+      tables: db.tables?.length ?? 0,
+      rows: db.rows?.length ?? 0,
+      ledger: db.ledger?.length ?? 0,
+    },
+    memory: { rss: memory.rss, heapUsed: memory.heapUsed },
+  });
+});
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/tables', tableRoutes);
@@ -100,6 +163,10 @@ app.use((err, req, res, next) => {
   }
   if (err?.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ message: '文件不能超过 20MB' });
+  }
+  if (err?.name === 'MulterError') {
+    // 字段名错误、文件数超限等属于请求格式问题，不能落到 500
+    return res.status(400).json({ message: `上传文件不符合要求（${err.code || err.message}）` });
   }
   if (err?.type === 'entity.parse.failed') {
     // body-parser 的原始报错是英文，直接透传会把内部解析细节暴露给前端

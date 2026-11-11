@@ -2,34 +2,68 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import { getDb, saveDbSoon, now } from '../db.js';
 import { requireAuth, signToken, publicUser, logAction, BCRYPT_ROUNDS } from '../auth.js';
+import { asyncHandler } from '../http.js';
 
 const router = express.Router();
 
 const attempts = new Map(); // `${username}|${ip}` -> { count, until }
+const ipAttempts = new Map(); // ip -> { count, until }
 const MAX_ATTEMPTS = 6;
+const IP_MAX_ATTEMPTS = 40;
 const WINDOW_MS = 5 * 60 * 1000;
+const MAX_USERNAME_LENGTH = 64;
+const MAX_PASSWORD_LENGTH = 200;
 
 /** 清掉过期记录，避免长期运行后 Map 只增不减 */
 function pruneAttempts() {
   const ts = Date.now();
-  for (const [key, record] of attempts) {
-    if (record.until < ts) attempts.delete(key);
-  }
-  while (attempts.size > 2000) {
-    const first = attempts.keys().next().value;
-    attempts.delete(first);
+  for (const map of [attempts, ipAttempts]) {
+    for (const [key, record] of map) {
+      if (record.until < ts) map.delete(key);
+    }
+    while (map.size > 2000) {
+      const first = map.keys().next().value;
+      map.delete(first);
+    }
   }
 }
 
-router.post('/login', (req, res) => {
+function clientIp(req) {
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function bump(map, key) {
+  const record = map.get(key);
+  const next = record && Date.now() < record.until ? record : { count: 0, until: 0 };
+  next.count += 1;
+  next.until = Date.now() + WINDOW_MS;
+  map.set(key, next);
+}
+
+router.post('/login', asyncHandler(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ message: '请输入用户名和密码' });
   }
+  const usernameText = String(username).trim();
+  const passwordText = String(password);
+  if (usernameText.length > MAX_USERNAME_LENGTH) {
+    return res.status(400).json({ message: `用户名最多 ${MAX_USERNAME_LENGTH} 个字符` });
+  }
+  if (passwordText.length > MAX_PASSWORD_LENGTH) {
+    return res.status(400).json({ message: `密码最多 ${MAX_PASSWORD_LENGTH} 个字符` });
+  }
   pruneAttempts();
-  const usernameKey = String(username).trim().toLowerCase();
+  const ip = clientIp(req);
+  const ipKey = ip;
+  const ipRecord = ipAttempts.get(ipKey);
+  if (ipRecord && ipRecord.count >= IP_MAX_ATTEMPTS && Date.now() < ipRecord.until) {
+    const wait = Math.ceil((ipRecord.until - Date.now()) / 1000);
+    return res.status(429).json({ message: `尝试次数过多，请 ${wait} 秒后重试` });
+  }
+  const usernameKey = usernameText.toLowerCase();
   // 用户名 + 来源 IP 作为锁定键：别人无法通过刷错密码把某个账号整体锁死
-  const attemptKey = `${usernameKey}|${req.ip || req.socket?.remoteAddress || ''}`;
+  const attemptKey = `${usernameKey}|${ip}`;
   const record = attempts.get(attemptKey);
   if (record && record.count >= MAX_ATTEMPTS && Date.now() < record.until) {
     const wait = Math.ceil((record.until - Date.now()) / 1000);
@@ -38,21 +72,27 @@ router.post('/login', (req, res) => {
 
   const db = getDb();
   const user = db.users.find((u) => u.username.toLowerCase() === usernameKey);
-  const ok = user && bcrypt.compareSync(String(password), user.passwordHash);
+  let ok = false;
+  if (user?.passwordHash) {
+    try {
+      ok = await bcrypt.compare(passwordText, user.passwordHash);
+    } catch {
+      ok = false;
+    }
+  }
   if (!ok) {
-    const next = record && Date.now() < record.until ? record : { count: 0, until: 0 };
-    next.count += 1;
-    next.until = Date.now() + WINDOW_MS;
-    attempts.set(attemptKey, next);
+    bump(attempts, attemptKey);
+    bump(ipAttempts, ipKey);
     return res.status(401).json({ message: '用户名或密码错误' });
   }
 
   attempts.delete(attemptKey);
+  ipAttempts.delete(ipKey);
   user.lastLoginAt = now();
   saveDbSoon();
   logAction(user, '登录系统', '登录', `${user.role === 'admin' ? '管理员' : '成员'}登录成功`);
   res.json({ token: signToken(user), user: publicUser(user) });
-});
+}));
 
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
@@ -82,7 +122,12 @@ router.post('/password', requireAuth, (req, res) => {
 });
 
 router.post('/logout', requireAuth, (req, res) => {
-  logAction(req.user, '退出登录', '登录', '');
+  // 没有服务端会话表，递增 tokenVersion 是让当前用户旧 JWT 立即失效的最简方式。
+  // 代价是该用户在其他设备上的登录也会退出；对小团队工具可接受。
+  req.user.tokenVersion = (req.user.tokenVersion ?? 0) + 1;
+  req.user.updatedAt = now();
+  saveDbSoon();
+  logAction(req.user, '退出登录', '登录', '旧令牌已失效');
   res.json({ message: 'ok' });
 });
 

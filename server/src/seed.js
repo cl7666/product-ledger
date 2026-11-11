@@ -1,6 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import bcrypt from 'bcryptjs';
-import { getDb, saveDb, resetDb, uid } from './db.js';
+import { getDb, loadDb, saveDb, resetDb, uid } from './db.js';
 import { ledgerAmount } from './ledger-fields.js';
 import { toDateOnly } from './store.js';
 import { BCRYPT_ROUNDS } from './auth.js';
@@ -30,7 +30,14 @@ const PRODUCTS = [
   ['P-10015', '标签打印纸', '40×30 1000 张', '包装耗材', '卷', 26, 5, 'D区-02', '顺发包装', '在库', '需要补货'],
 ];
 
-export function seed() {
+export function seed({ force = false } = {}) {
+  const current = getDb();
+  const nonEmpty = ['users', 'tables', 'rows', 'ledger', 'logs'].filter((key) => current[key]?.length > 0);
+  if (!force && nonEmpty.length) {
+    throw new Error(
+      `数据库已有数据（${nonEmpty.join('、')}），已拒绝覆盖。如确认要重建演示数据，请执行：npm run seed:force`,
+    );
+  }
   resetDb({});
   const db = getDb();
 
@@ -263,7 +270,14 @@ export function totalLedgerValue() {
   return getDb().ledger.reduce((acc, l) => acc + ledgerAmount(l), 0);
 }
 
-// 允许直接 `node src/seed.js` 重建数据
+// 允许直接 `node src/seed.js` 初始化演示数据；已有数据时必须显式 --force。
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  seed();
+  const force = process.argv.includes('--force') || process.env.FORCE_SEED === '1';
+  try {
+    loadDb();
+    seed({ force });
+  } catch (err) {
+    console.error(`[seed] ${err.message}`);
+    process.exit(1);
+  }
 }

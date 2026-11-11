@@ -16,23 +16,44 @@ export function parseFilters(raw, allowedFields) {
     throw new HttpError(400, '筛选条件不是合法的 JSON');
   }
   if (!Array.isArray(arr)) throw new HttpError(400, '筛选条件必须是数组');
-  const filters = arr.filter((f) => f && typeof f.field === 'string' && f.field);
-  if (allowedFields) {
-    for (const f of filters) {
-      if (!allowedFields.has(f.field)) {
-        throw new HttpError(400, `筛选字段不存在：${f.field}`);
-      }
+  const filters = [];
+  for (const f of arr) {
+    if (!f || typeof f !== 'object' || Array.isArray(f)) {
+      throw new HttpError(400, '筛选条件必须是对象数组');
     }
-  }
-  return filters.map((f) => {
+    const field = typeof f.field === 'string' ? f.field.trim() : '';
+    if (!field) throw new HttpError(400, '筛选字段不能为空');
+    if (allowedFields && !allowedFields.has(field)) {
+      throw new HttpError(400, `筛选字段不存在：${field}`);
+    }
     const op = f.op || 'contains';
     if (!FILTER_OPS.has(op)) throw new HttpError(400, `不支持的筛选运算符：${op}`);
-    return { ...f, op };
-  });
+    if (op === 'between' && (!Array.isArray(f.value) || f.value.length !== 2 || f.value.some((v) => v === '' || v === null || v === undefined))) {
+      throw new HttpError(400, 'between 筛选需要提供两个非空值');
+    }
+    filters.push({ ...f, field, op });
+  }
+  return filters;
 }
 
 function asString(v) {
   return v === null || v === undefined ? '' : String(v);
+}
+
+const DATE_LIKE = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/;
+
+/** 把数字或日期字符串转成可比较值；无法比较时返回 null（而不是 NaN） */
+function comparable(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (DATE_LIKE.test(text)) {
+    const ts = Date.parse(text.replace(' ', 'T'));
+    return Number.isNaN(ts) ? null : ts;
+  }
+  const n = Number(text.replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
 }
 
 export function matchFilter(value, op, target) {
@@ -48,21 +69,30 @@ export function matchFilter(value, op, target) {
     case 'notcontains':
       return !s.includes(t);
     case 'gt':
-      return Number(value) > Number(target);
     case 'gte':
-      return Number(value) >= Number(target);
     case 'lt':
-      return Number(value) < Number(target);
-    case 'lte':
-      return Number(value) <= Number(target);
+    case 'lte': {
+      const left = comparable(value);
+      const right = comparable(target);
+      if (left === null || right === null) return false;
+      if (op === 'gt') return left > right;
+      if (op === 'gte') return left >= right;
+      if (op === 'lt') return left < right;
+      return left <= right;
+    }
     case 'empty':
       return s === '';
     case 'notempty':
       return s !== '';
     case 'between': {
-      if (!Array.isArray(target) || target.length < 2) return true;
-      const n = Number(value);
-      return n >= Number(target[0]) && n <= Number(target[1]);
+      if (!Array.isArray(target) || target.length !== 2) {
+        throw new HttpError(400, 'between 筛选需要提供两个值');
+      }
+      const n = comparable(value);
+      const low = comparable(target[0]);
+      const high = comparable(target[1]);
+      if (n === null || low === null || high === null) return false;
+      return n >= low && n <= high;
     }
     case 'in': {
       const list = Array.isArray(target) ? target : String(target).split(',');

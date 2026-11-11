@@ -404,7 +404,7 @@ export default function TableDetail() {
   const doBatchDelete = () => {
     modal.confirm({
       title: `删除选中的 ${selected.length} 条数据？`,
-      content: '属于他人创建的数据会被跳过，删除后无法恢复。',
+      content: '无权限删除的行会被跳过（仅行创建者、表格创建者或管理员可删除），删除后无法恢复。',
       okText: '删除',
       okButtonProps: { danger: true },
       cancelText: '取消',

@@ -25,9 +25,18 @@ export default defineConfig({
     chunkSizeWarningLimit: 900,
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom', 'react-router-dom'],
-          antd: ['antd', '@ant-design/icons'],
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@ant-design/icons')) return 'icons';
+          // antd 的 barrel 会重新导出所有组件，按组件拆会让 antd 与组件 chunk 互相引用；
+          // 这里只把 antd 本体和它依赖的 rc-* / @ant-design 基础库分开，避免循环 chunk。
+          if (id.includes('/antd/')) return 'antd';
+          if (id.includes('/rc-') || id.includes('/@rc-component/') || id.includes('/@ant-design/')) {
+            return 'antd-core';
+          }
+          if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/react-router')) return 'react';
+          if (id.includes('/dayjs/')) return 'dayjs';
+          return undefined;
         },
       },
     },
