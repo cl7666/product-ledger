@@ -246,8 +246,11 @@ router.post('/import/commit', (req, res) => {
   if (pairs.some(([, idx]) => idx >= source.headers.length)) {
     throw new HttpError(400, '映射的列超出了该工作表的表头范围，请重新上传并选择正确的工作表');
   }
-  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2
+  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2；
+  // rowNumbers 与解析后的 rows 一一对应，能覆盖空行、合计行造成的行号跳变
   const dataStartRow = Number.isInteger(source.dataStartRow) && source.dataStartRow > 0 ? source.dataStartRow : 2;
+  const rowNumberOf = (i) =>
+    (Array.isArray(source.rowNumbers) && Number.isInteger(source.rowNumbers[i]) ? source.rowNumbers[i] : dataStartRow + i);
   const db = getDb();
 
   const index = new Map();
@@ -281,7 +284,7 @@ router.post('/import/commit', (req, res) => {
     });
     if (badNumber) {
       const f = LEDGER_WRITABLE_FIELDS.find((x) => x.key === badNumber[0]);
-      fail(dataStartRow + i, `「${f.label}」不是有效数字：${cells[badNumber[1]]}`);
+      fail(rowNumberOf(i), `「${f.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     let clean;
@@ -290,18 +293,18 @@ router.post('/import/commit', (req, res) => {
       // 新增分支的默认值在下方 entry 构造时兜底，行为不变
       clean = readLedgerPayload(payload, { skipEmpty: mode === 'upsert' });
     } catch (err) {
-      fail(dataStartRow + i, err.message || '数据格式不正确');
+      fail(rowNumberOf(i), err.message || '数据格式不正确');
       return;
     }
     if (!clean.name && !clean.code) {
-      fail(dataStartRow + i, '产品名称与产品编号均为空');
+      fail(rowNumberOf(i), '产品名称与产品编号均为空');
       return;
     }
     // 追加模式不覆盖已有记录；编号已存在时按行失败，避免绕过「编号唯一」制造重复台账
     if (mode === 'append' && clean.code) {
       const key = clean.code.trim().toLowerCase();
       if (existingCodes.has(key)) {
-        fail(dataStartRow + i, `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`);
+        fail(rowNumberOf(i), `产品编号「${clean.code}」已存在；追加模式不会覆盖，请改用「按编号更新」或修改编号`);
         return;
       }
     }
@@ -309,19 +312,19 @@ router.post('/import/commit', (req, res) => {
       const key = String(clean.code || '').trim().toLowerCase();
       // 编号为空时不能匹配，也不能静默降级成"新增 AUTO 编号"
       if (!key) {
-        fail(dataStartRow + i, '产品编号为空，无法按编号匹配更新');
+        fail(rowNumberOf(i), '产品编号为空，无法按编号匹配更新');
         return;
       }
       const found = index.get(key);
       if (found) {
         if (!canEditLedger(req.user, found)) {
-          fail(dataStartRow + i, '无权覆盖他人录入的台账，可联系管理员处理');
+          fail(rowNumberOf(i), '无权覆盖他人录入的台账，可联系管理员处理');
           return;
         }
         try {
           validateLedgerEntry({ ...found, ...clean });
         } catch (err) {
-          fail(dataStartRow + i, err.message);
+          fail(rowNumberOf(i), err.message);
           return;
         }
         Object.assign(found, clean, { updatedAt: now(), updatedBy: req.user.id });
@@ -351,7 +354,7 @@ router.post('/import/commit', (req, res) => {
     try {
       validateLedgerEntry(entry);
     } catch (err) {
-      fail(dataStartRow + i, err.message);
+      fail(rowNumberOf(i), err.message);
       return;
     }
     db.ledger.push(entry);

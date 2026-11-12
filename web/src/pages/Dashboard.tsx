@@ -165,7 +165,8 @@ export default function Dashboard() {
           <div className="panel">
             <div className="panel-head">
               <div className="panel-title">
-                <FileExcelOutlined style={{ color: '#17a673' }} /> 最近操作
+                <FileExcelOutlined style={{ color: '#17a673' }} />
+                {user?.role === 'admin' ? ' 最近操作' : ' 我的最近操作'}
               </div>
             </div>
             <div className="panel-body" style={{ paddingTop: 8 }}>
@@ -174,7 +175,7 @@ export default function Dashboard() {
                 rowKey="id"
                 pagination={false}
                 dataSource={stats?.recentLogs || []}
-                locale={{ emptyText: <Empty description="暂无操作记录" /> }}
+                locale={{ emptyText: <Empty description={user?.role === 'admin' ? '暂无操作记录' : '你还没有操作记录'} /> }}
                 showHeader={false}
                 columns={[
                   {

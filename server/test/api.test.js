@@ -2,13 +2,14 @@
  * 接口回归测试：启动一个使用独立数据库的服务实例，跑完整业务闭环。
  * 运行：npm run test:api
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
 import { buildWorkbook, parseWorkbook } from '../src/excel.js';
 import { putSession } from '../src/import-sessions.js';
+import { matchFilter } from '../src/query.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -914,6 +915,34 @@ async function main() {
       JSON.stringify(syncNum.data),
     );
 
+    // 16.5c sync-ledger 的失败明细带「本次同步的第几条」，前端靠它定位到具体行
+    const syncErrTable = await api('/tables', {
+      method: 'POST', token: adminToken,
+      body: {
+        name: '回归-同步明细',
+        columns: [
+          { label: '编号', key: 'code', type: 'text' },
+          { label: '单价', key: 'price', type: 'text' },
+        ],
+      },
+    });
+    for (const row of [
+      { code: 'REG-ERR-1', price: '1' },
+      { code: 'REG-ERR-2', price: 'oops' },
+      { code: 'REG-ERR-3', price: '3' },
+    ]) {
+      await api(`/tables/${syncErrTable.data.table.id}/rows`, { method: 'POST', token: adminToken, body: row });
+    }
+    const syncErr = await api(`/tables/${syncErrTable.data.table.id}/sync-ledger`, {
+      method: 'POST', token: adminToken,
+      body: { scope: 'all', mode: 'upsert', mapping: { code: 'code', price: 'price' } },
+    });
+    check(
+      '同步失败明细带序号',
+      syncErr.data.created === 2 && syncErr.data.skipped === 1 && syncErr.data.errors?.[0]?.row === 2,
+      JSON.stringify(syncErr.data),
+    );
+
     // 16.5b sync-ledger 按编号更新时，空编号行按行跳过而不是生成 AUTO 编号
     const noCodeTable = await api('/tables', {
       method: 'POST', token: adminToken,
@@ -1783,6 +1812,285 @@ async function main() {
       sessionError = err;
     }
     check('导入会话字节上限生效(413)', sessionError?.status === 413, JSON.stringify(sessionError?.message));
+
+    // 18.10 时间戳区间筛选：ISO 串（now() 生成的 ...Z）此前无法解析，gte/lt/between 恒为空
+    const tsFilter = (op, value) =>
+      `/tables/${productTable.id}/rows?filters=${encodeURIComponent(JSON.stringify([{ field: '_updatedAt', op, value }]))}`;
+    const tsGte = await api(tsFilter('gte', '2000-01-01'), { token: adminToken });
+    const tsLte = await api(tsFilter('lte', '2999-12-31'), { token: adminToken });
+    const tsBetween = await api(tsFilter('between', ['2000-01-01', '2999-12-31']), { token: adminToken });
+    check(
+      '时间戳区间筛选命中(gte/lte/between)',
+      tsGte.data.total > 0 && tsLte.data.total > 0 && tsBetween.data.total > 0,
+      JSON.stringify({ gte: tsGte.data.total, lte: tsLte.data.total, between: tsBetween.data.total }),
+    );
+    const dateVsTime = matchFilter('2026-11-11', 'gte', '2026-11-11 00:00');
+    check('纯日期与本地时间串同一基准', dateVsTime === true, String(dateVsTime));
+
+    // 18.11 设置密码与登录共用长度上限：否则能设置成功却永远无法登录（账号锁死）
+    const overlongPwd = 'p'.repeat(201);
+    const selfChange = await api('/auth/password', {
+      method: 'POST', token: memberToken,
+      body: { oldPassword: 'newpass123', newPassword: overlongPwd },
+    });
+    check(
+      '自助改密超长被拒绝(400)',
+      selfChange.status === 400 && /72 字节/.test(selfChange.data.message || ''),
+      JSON.stringify(selfChange.data),
+    );
+    const resetLong = await api(`/users/${logoutUserRes.data.user.id}`, {
+      method: 'PATCH', token: adminToken, body: { password: overlongPwd },
+    });
+    check(
+      '管理员重置超长密码被拒绝(400)',
+      resetLong.status === 400 && /72 字节/.test(resetLong.data.message || ''),
+      JSON.stringify(resetLong.data),
+    );
+    const createLong = await api('/users', {
+      method: 'POST', token: adminToken,
+      body: { username: `long_${Date.now()}`, name: '长密码', password: overlongPwd, role: 'member' },
+    });
+    check('创建用户超长密码被拒绝(400)', createLong.status === 400, JSON.stringify(createLong.data));
+
+    // 18.11b 上限按 UTF-8 字节而非字符：bcrypt 只比较前 72 字节，
+    //       所以 72 字节必须能设置、73 字节必须被拒（汉字按 3 字节计）。
+    const cjk24 = '密'.repeat(24); // 72 字节
+    const cjk25 = '密'.repeat(25); // 75 字节
+    const makeUser = (suffix, pwd) => api('/users', {
+      method: 'POST',
+      token: adminToken,
+      body: { username: `p_${suffix}_${Date.now().toString(36)}`, name: '边界', password: pwd, role: 'member' },
+    });
+    check('72 字节密码可创建', (await makeUser('a72', 'a'.repeat(72))).status === 201);
+    check('73 字节密码被拒绝(400)', (await makeUser('a73', 'a'.repeat(73))).status === 400);
+    check('24 个汉字(72 字节)可创建', (await makeUser('c24', cjk24)).status === 201);
+    check('25 个汉字(75 字节)被拒绝(400)', (await makeUser('c25', cjk25)).status === 400);
+    const loginByteLimit = await api('/auth/login', {
+      method: 'POST', body: { username: 'zhangsan', password: 'a'.repeat(73) },
+    });
+    check('登录侧同样按 72 字节拦截(400)', loginByteLimit.status === 400, JSON.stringify(loginByteLimit.data));
+    const stillLogin = await api('/auth/login', {
+      method: 'POST', body: { username: 'zhangsan', password: 'newpass123' },
+    });
+    check('改密失败后原密码仍可登录', stillLogin.ok, JSON.stringify(stillLogin.data.message));
+
+    // 18.12 单列文件：列名本身像“清单 / 明细”时不能当标题跳过，否则首行数据丢失
+    const headerLike = await parseWorkbook(await makeXlsx([['库存明细'], ['A-100'], ['A-200']]));
+    check(
+      '单列表头像清单名不丢首行',
+      headerLike[0].headers[0] === '库存明细' && headerLike[0].rows.length === 2,
+      JSON.stringify({ headers: headerLike[0].headers, rows: headerLike[0].rows }),
+    );
+
+    // 18.12b 单列中文：标题行必须跳过。此前按“字符形状是否同构”判断，而中文列名与中文数据
+    //       恒同构（「产品名称」与「无线鼠标」都是 4 个汉字），等于把跳过标题的分支永久关掉，
+    //       结果列名变成「产品清单」、表头文字被当成数据行静默导入。
+    const cnTitle = await parseWorkbook(await makeXlsx([
+      ['产品清单'], ['产品名称'], ['无线鼠标'], ['有线键盘'],
+    ]));
+    check(
+      '单列中文标题被跳过',
+      cnTitle[0].headers[0] === '产品名称' && cnTitle[0].rows.length === 2,
+      JSON.stringify({ headers: cnTitle[0].headers, rows: cnTitle[0].rows }),
+    );
+    const cnTitleLedger = await parseWorkbook(
+      await makeXlsx([['产品清单'], ['产品名称'], ['无线鼠标']]),
+      { expectedLabels: ['产品编号', '产品名称', '规格型号', '单位', '单价', '库存数量', '仓库', '供应商', '状态', '备注'] },
+    );
+    check(
+      '单列中文标题被跳过(有字段名)',
+      cnTitleLedger[0].headers[0] === '产品名称' && cnTitleLedger[0].rows.length === 1,
+      JSON.stringify({ headers: cnTitleLedger[0].headers, rows: cnTitleLedger[0].rows }),
+    );
+    const cnNoTitle = await parseWorkbook(await makeXlsx([
+      ['产品名称'], ['无线鼠标'], ['有线键盘'],
+    ]));
+    check(
+      '单列中文无标题时不误跳过首行',
+      cnNoTitle[0].headers[0] === '产品名称' && cnNoTitle[0].rows.length === 2,
+      JSON.stringify({ headers: cnNoTitle[0].headers, rows: cnNoTitle[0].rows }),
+    );
+
+    // 18.13 行号：顶部空行 / 中间的合计行都要按真实 Excel 行号报错
+    const blankTop = await parseWorkbook(await makeXlsx([[], [], ['名称'], ['A'], ['B']]));
+    check(
+      '顶部空行不偏移行号',
+      blankTop[0].dataStartRow === 4 && blankTop[0].rowNumbers.join(',') === '4,5',
+      JSON.stringify({ start: blankTop[0].dataStartRow, rows: blankTop[0].rowNumbers }),
+    );
+    const summaryMid = await parseWorkbook(await makeXlsx([
+      ['名称', '数量'], ['A', '1'], ['合计（1 条）', '1'], ['B', '2'],
+    ]));
+    check(
+      '合计行后行号不偏移',
+      summaryMid[0].rowNumbers.join(',') === '2,4',
+      JSON.stringify(summaryMid[0].rowNumbers),
+    );
+
+    // 18.14 导出：带时区的时间戳按本地时间写出（此前直接取 UTC 墙钟，东八区早 8 小时）
+    const tzBuffer = await buildWorkbook({
+      columns: [{ key: 't', label: '更新时间', type: 'date' }],
+      rows: [{ t: '2026-11-11T08:00:00.000Z' }],
+      title: '时区测试',
+    });
+    const tzBook = new ExcelJS.Workbook();
+    await tzBook.xlsx.load(tzBuffer);
+    const tzCell = tzBook.worksheets[0].getCell('A4');
+    const instant = new Date('2026-11-11T08:00:00.000Z');
+    const expectSerial = Date.UTC(
+      instant.getFullYear(), instant.getMonth(), instant.getDate(),
+      instant.getHours(), instant.getMinutes(), instant.getSeconds(),
+    );
+    check(
+      '带时区时间戳导出为本地时间',
+      tzCell.value instanceof Date && tzCell.value.getTime() === expectSerial,
+      JSON.stringify({ got: tzCell.value instanceof Date ? tzCell.value.toISOString() : tzCell.value }),
+    );
+
+    // 18.15b 台账字段元数据与日志可见性
+    const ledgerMeta = await api('/tables/meta/ledger-fields', { token: adminToken });
+    const amountField = (ledgerMeta.data.fields || []).find((f) => f.key === 'amount');
+    check(
+      '元数据下发 computed 标记',
+      amountField?.computed === true && amountField?.type === 'computed',
+      JSON.stringify(amountField),
+    );
+    const memberMe = await api('/auth/me', { token: memberToken });
+    const memberStats = await api('/stats', { token: memberToken });
+    const adminStats = await api('/stats', { token: adminToken });
+    const memberLogs = memberStats.data.recentLogs || [];
+    const adminLogs = adminStats.data.recentLogs || [];
+    check(
+      '成员工作台只回自己的日志',
+      memberLogs.every((l) => l.userId === memberMe.data.user.id)
+        && adminLogs.some((l) => l.userId !== memberMe.data.user.id),
+      JSON.stringify({ member: memberLogs.map((l) => l.username), admin: adminLogs.length }),
+    );
+
+    // 18.16 遗留项修复：非法日期不被顺延、导出回导保留时分秒、
+    //       纯日期上界含当天、dataStartRow 为真实首行、单列“入库明细”标题可跳过
+    const dirtyDateBuf = await buildWorkbook({
+      columns: [{ key: 'd', label: '日期', type: 'date' }],
+      rows: [{ d: '2026-13-45' }],
+      title: '脏日期',
+    });
+    const dirtyBook = new ExcelJS.Workbook();
+    await dirtyBook.xlsx.load(dirtyDateBuf);
+    const dirtyCell = dirtyBook.worksheets[0].getCell('A4');
+    check(
+      '非法日期按文本导出而非顺延',
+      dirtyCell.value === '2026-13-45',
+      JSON.stringify({ got: dirtyCell.value instanceof Date ? dirtyCell.value.toISOString() : dirtyCell.value }),
+    );
+
+    const tsInstant = new Date('2026-11-11T16:30:45.000Z');
+    const p2 = (n) => String(n).padStart(2, '0');
+    const expectLocal = `${tsInstant.getFullYear()}-${p2(tsInstant.getMonth() + 1)}-${p2(tsInstant.getDate())}`
+      + ` ${p2(tsInstant.getHours())}:${p2(tsInstant.getMinutes())}:${p2(tsInstant.getSeconds())}`;
+    const roundTrip = await parseWorkbook(await buildWorkbook({
+      columns: [{ key: 'd', label: '日期', type: 'date' }],
+      rows: [{ d: '2026-11-11T16:30:45.000Z' }],
+      title: '产品清单',
+    }), { expectedLabels: ['日期'] });
+    check(
+      '导出回导保留时分秒',
+      roundTrip[0].rows[0][0] === expectLocal,
+      JSON.stringify({ got: roundTrip[0].rows[0][0], want: expectLocal }),
+    );
+
+    const localNoon = new Date(2026, 10, 11, 12, 0, 0).toISOString();
+    const nextMidnight = new Date(2026, 10, 12, 0, 0, 0).toISOString();
+    check('纯日期上界包含当天(lte)', matchFilter(localNoon, 'lte', '2026-11-11') === true, localNoon);
+    check(
+      '纯日期上界包含当天(between)',
+      matchFilter(localNoon, 'between', ['2026-11-11', '2026-11-11']) === true,
+      localNoon,
+    );
+    check(
+      '次日零点不在纯日期区间内',
+      matchFilter(nextMidnight, 'between', ['2026-11-11', '2026-11-11']) === false,
+      nextMidnight,
+    );
+
+    const gap = await parseWorkbook(await makeXlsx([['名称', '数量'], [], ['A', '1'], ['B', '2']]));
+    check(
+      'dataStartRow 等于真实首条数据行',
+      gap[0].dataStartRow === 3 && gap[0].headerRow === 1,
+      JSON.stringify({ start: gap[0].dataStartRow, header: gap[0].headerRow, rows: gap[0].rowNumbers }),
+    );
+    const inbound = await parseWorkbook(await makeXlsx([['入库明细'], ['日期'], ['2026-11-01'], ['2026-11-02']]));
+    check(
+      '单列“入库明细”标题可跳过',
+      inbound[0].headers[0] === '日期' && inbound[0].rows.length === 2,
+      JSON.stringify({ headers: inbound[0].headers, rows: inbound[0].rows }),
+    );
+
+    // 18.15 空库启动：无账号时登录返回 503；按提示在另一个进程执行 seed 后，
+    //       **不重启服务**也应能登录（seed 只写磁盘，服务端需在空库时重读 db.json）
+    const EMPTY_DB = 'data/test-empty-db.json';
+    const EMPTY_PORT = 4401;
+    const EMPTY_BASE = `http://127.0.0.1:${EMPTY_PORT}/api`;
+    const emptyDbPath = path.join(ROOT, EMPTY_DB);
+    if (fs.existsSync(emptyDbPath)) fs.unlinkSync(emptyDbPath);
+    const emptyServer = spawn(process.execPath, ['src/index.js'], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: String(EMPTY_PORT), DB_FILE: EMPTY_DB, SEED_DEMO: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const emptyLogs = [];
+    emptyServer.stdout.on('data', (d) => emptyLogs.push(String(d)));
+    emptyServer.stderr.on('data', (d) => emptyLogs.push(String(d)));
+    const emptyApi = async (pathname, { method = 'GET', body } = {}) => {
+      const headers = body === undefined ? {} : { 'Content-Type': 'application/json' };
+      const res = await fetch(`${EMPTY_BASE}${pathname}`, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      return { status: res.status, ok: res.ok, data };
+    };
+    try {
+      let ready = false;
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 15000) {
+        try {
+          if ((await fetch(`${EMPTY_BASE}/health`)).ok) { ready = true; break; }
+        } catch { /* retry */ }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      check('空库服务可启动', ready, emptyLogs.join(''));
+
+      const noInit = await emptyApi('/auth/login', {
+        method: 'POST', body: { username: 'admin', password: 'admin123' },
+      });
+      check(
+        '空库登录返回 503 且提示初始化',
+        noInit.status === 503 && /尚未初始化/.test(noInit.data.message || ''),
+        JSON.stringify(noInit.data),
+      );
+
+      // 模拟 README 指引：在另一个进程执行 npm run seed
+      execFileSync(process.execPath, ['src/seed.js'], {
+        cwd: ROOT, env: { ...process.env, DB_FILE: EMPTY_DB }, stdio: 'ignore',
+      });
+      const afterSeed = await emptyApi('/auth/login', {
+        method: 'POST', body: { username: 'admin', password: 'admin123' },
+      });
+      check(
+        'seed 后无需重启即可登录',
+        afterSeed.status === 200 && !!afterSeed.data.token,
+        JSON.stringify(afterSeed.data),
+      );
+      const healthAfter = await emptyApi('/health');
+      check(
+        'seed 后健康检查反映新库',
+        (healthAfter.data.db?.users ?? 0) >= 1,
+        JSON.stringify(healthAfter.data.db),
+      );
+    } finally {
+      emptyServer.kill();
+      await new Promise((r) => setTimeout(r, 300));
+      if (fs.existsSync(emptyDbPath)) fs.unlinkSync(emptyDbPath);
+    }
 
   } finally {
     server.kill();

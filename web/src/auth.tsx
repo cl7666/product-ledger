@@ -6,6 +6,8 @@ interface AuthContextValue {
   user: User | null;
   ready: boolean;
   isAdmin: boolean;
+  /** 非鉴权类失败（断网 / 502 / 超时）的原因；此时 token 与用户都保留，界面应提供重试 */
+  authError: string | null;
   login: (username: string, password: string) => Promise<User>;
   logout: () => void;
   refresh: () => Promise<void>;
@@ -17,20 +19,29 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!tokenStore.get()) {
       setUser(null);
+      setAuthError(null);
       return;
     }
     try {
       const me = await api.me();
       setUser(me);
+      setAuthError(null);
     } catch (err) {
-      // 只有明确的鉴权失败才清除 token；后端重启、代理 502、超时不应把用户踢下线
+      // 只有明确的鉴权失败才清除 token；后端重启、代理 502、超时不应把用户踢下线，
+      // 否则一次网络抖动就会让用户重输密码，且本地 token 其实还在。
       const status = (err as { status?: number }).status;
-      if (status === 401 || status === 403) tokenStore.clear();
-      setUser(null);
+      if (status === 401 || status === 403) {
+        tokenStore.clear();
+        setUser(null);
+        setAuthError(null);
+        return;
+      }
+      setAuthError((err as Error).message || '服务暂时不可用，请稍后重试');
     }
   }, []);
 
@@ -45,6 +56,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     onUnauthorized(() => {
       tokenStore.clear();
       setUser(null);
+      setAuthError(null);
     });
   }, []);
 
@@ -52,6 +64,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const data = await api.login(username, password);
     tokenStore.set(data.token);
     setUser(data.user);
+    setAuthError(null);
     return data.user;
   }, []);
 
@@ -59,11 +72,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     api.logout();
     tokenStore.clear();
     setUser(null);
+    setAuthError(null);
   }, []);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ user, ready, isAdmin: user?.role === 'admin', login, logout, refresh, setUser }),
-    [user, ready, login, logout, refresh],
+    () => ({ user, ready, isAdmin: user?.role === 'admin', authError, login, logout, refresh, setUser }),
+    [user, ready, authError, login, logout, refresh],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

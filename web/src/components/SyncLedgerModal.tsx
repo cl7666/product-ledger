@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Modal, Radio, Select, Tag, App as AntdApp } from 'antd';
+import { Alert, Button, Modal, Radio, Select, Table, Tag, App as AntdApp } from 'antd';
 import { SwapOutlined } from '@ant-design/icons';
 import { api } from '../api';
 import type { DataTable, LedgerFieldMeta } from '../types';
-import { ledgerFieldGuess } from '../utils';
+import { ledgerFieldGuess, writableLedgerFields } from '../utils';
 
 interface Props {
   open: boolean;
@@ -14,26 +14,38 @@ interface Props {
 }
 
 export default function SyncLedgerModal({ open, table, selectedIds, onCancel, onDone }: Props) {
-  const { message } = AntdApp.useApp();
+  const { message, modal } = AntdApp.useApp();
   const [fields, setFields] = useState<LedgerFieldMeta[]>([]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [scope, setScope] = useState<'all' | 'selected'>('all');
   const [mode, setMode] = useState<'upsert' | 'insert'>('upsert');
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
+  // 部分失败时保留接口返回的明细：只提示“跳过 3 条”用户无法定位是哪几行、为什么
+  const [result, setResult] = useState<{
+    created: number;
+    updated: number;
+    skipped: number;
+    errorsTruncated?: boolean;
+    errors?: { row: number; code?: string; message: string }[];
+  } | null>(null);
 
   useEffect(() => {
     if (!open || !table) return;
     setScope(selectedIds.length ? 'selected' : 'all');
     setMode('upsert');
+    setResult(null);
     setFetching(true);
     api.ledger
       .fields()
       .then((list) => {
-        setFields(list.filter((f) => !f.computed && !f.readOnly));
+        setFields(list);
+        // 传 {key,label} 而不是 key 数组：ledgerFieldGuess 的标签匹配层依赖真实标签，
+        // 只传 key 时 label 会退化成 key，非产品库存表模板永远匹配不到。
+        const ledgerKeys = writableLedgerFields(list).map((f) => ({ key: f.key, label: f.label }));
         const next: Record<string, string> = {};
         for (const col of table.columns) {
-          const target = ledgerFieldGuess(col, list.filter((f) => !f.computed && !f.readOnly).map((f) => f.key));
+          const target = ledgerFieldGuess(col, ledgerKeys);
           if (target && !next[target]) next[target] = col.key;
         }
         setMapping(next);
@@ -42,7 +54,7 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
       .finally(() => setFetching(false));
   }, [open, table, selectedIds.length, message]);
 
-  const writable = useMemo(() => fields.filter((f) => !f.computed && !f.readOnly), [fields]);
+  const writable = useMemo(() => writableLedgerFields(fields), [fields]);
   const mappedCount = Object.values(mapping).filter(Boolean).length;
   const hasCode = Boolean(mapping.code);
 
@@ -58,7 +70,7 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
     }
     if (scope === 'all') {
       const confirmed = await new Promise<boolean>((resolve) => {
-        Modal.confirm({
+        modal.confirm({
           title: '确认同步全部数据？',
           content: `将把「${table.name}」中全部 ${table.rowCount ?? ''} 行同步到产品台账，可能覆盖已有台账记录。`,
           okText: '继续同步',
@@ -77,9 +89,16 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
         mode,
         mapping: Object.fromEntries(Object.entries(mapping).filter(([, v]) => v)),
       });
-      message.success(res.message);
       onDone(res.message);
-      onCancel();
+      if (res.skipped > 0 && res.errors?.length) {
+        // 部分失败：留在弹窗里展示明细，避免“成功提示掩盖了部分失败”
+        setResult(res);
+        message.warning(res.message);
+      } else {
+        setResult(null);
+        message.success(res.message);
+        onCancel();
+      }
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -110,6 +129,35 @@ export default function SyncLedgerModal({ open, table, selectedIds, onCancel, on
         style={{ margin: '12px 0 16px' }}
         message="把表格里的行写入产品台账（固定 13 个字段）。映射正确后，台账可继续导出标准 Excel 台账。"
       />
+
+      {result && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={`已新增 ${result.created} 条、更新 ${result.updated} 条，${result.skipped} 条被跳过`}
+          description={
+            <>
+              <div className="text-muted" style={{ marginBottom: 8 }}>
+                「序号」是本次同步中的先后顺序
+                {result.errorsTruncated ? '；明细最多展示 30 条，其余已省略' : ''}
+              </div>
+              <Table
+                size="small"
+                rowKey={(r) => `${r.row}-${r.code || ''}-${r.message}`}
+                pagination={false}
+                scroll={{ y: 180 }}
+                dataSource={result.errors || []}
+                columns={[
+                  { title: '序号', dataIndex: 'row', width: 64 },
+                  { title: '产品编号', dataIndex: 'code', width: 150, render: (v: string) => v || '—' },
+                  { title: '跳过原因', dataIndex: 'message' },
+                ]}
+              />
+            </>
+          }
+        />
+      )}
 
       <div style={{ display: 'flex', gap: 28, flexWrap: 'wrap', marginBottom: 14 }}>
         <span>

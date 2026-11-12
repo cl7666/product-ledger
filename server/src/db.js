@@ -40,6 +40,14 @@ function migrateDb(raw) {
   if (version > CURRENT_DB_VERSION) {
     throw new Error(`数据库版本 ${version} 高于当前程序支持的版本 ${CURRENT_DB_VERSION}，请升级程序后再启动`);
   }
+  // 集合必须是数组。校验放在这里而不是 index.js，是为了让 seed.js 等其它入口同样受保护：
+  // 否则 `tables: {}` 会让 seed 的 `length > 0` 判断落空，误判为空库并覆盖数据。
+  const malformed = ['users', 'tables', 'rows', 'ledger', 'logs'].filter(
+    (key) => raw[key] !== undefined && !Array.isArray(raw[key]),
+  );
+  if (malformed.length) {
+    throw new Error(`数据文件结构异常：${malformed.join('、')} 必须是数组`);
+  }
   return {
     ...emptyDb(),
     ...raw,
@@ -57,9 +65,16 @@ export function loadDb() {
     try {
       raw = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     } catch (err) {
-      // 只有 JSON 语法错误才按“文件损坏”备份；版本/结构错误必须让用户看到并恢复
-      const backup = `${DB_FILE}.corrupt-${Date.now()}`;
-      fs.copyFileSync(DB_FILE, backup);
+      // 只有 JSON 语法错误才按“文件损坏”备份；版本/结构错误必须让用户看到并恢复。
+      // 备份名取自文件自身的 mtime 而不是当前时间：空库状态下重新载入（见 routes/auth.js）
+      // 会再次走到这里，同一份坏文件只应留下一份备份，而不是每次重试都复制一份。
+      let backup = `${DB_FILE}.corrupt-${Date.now()}`;
+      try {
+        backup = `${DB_FILE}.corrupt-${Math.trunc(fs.statSync(DB_FILE).mtimeMs)}`;
+      } catch {
+        /* 取不到 mtime 时退回时间戳命名 */
+      }
+      if (!fs.existsSync(backup)) fs.copyFileSync(DB_FILE, backup);
       console.error(`[db] 数据文件损坏，已备份到 ${backup}，使用空数据库启动：`, err.message);
       db = emptyDb();
       return db;

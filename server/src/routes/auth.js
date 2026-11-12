@@ -1,7 +1,17 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import { getDb, saveDbSoon, now } from '../db.js';
-import { requireAuth, signToken, publicUser, logAction, BCRYPT_ROUNDS } from '../auth.js';
+import { getDb, loadDb, saveDbSoon, now } from '../db.js';
+import {
+  requireAuth,
+  signToken,
+  publicUser,
+  logAction,
+  BCRYPT_ROUNDS,
+  MAX_USERNAME_LENGTH,
+  MAX_PASSWORD_BYTES,
+  PASSWORD_TOO_LONG_MESSAGE,
+  passwordByteLength,
+} from '../auth.js';
 import { asyncHandler } from '../http.js';
 
 const router = express.Router();
@@ -11,8 +21,6 @@ const ipAttempts = new Map(); // ip -> { count, until }
 const MAX_ATTEMPTS = 6;
 const IP_MAX_ATTEMPTS = 40;
 const WINDOW_MS = 5 * 60 * 1000;
-const MAX_USERNAME_LENGTH = 64;
-const MAX_PASSWORD_LENGTH = 200;
 
 /** 清掉过期记录，避免长期运行后 Map 只增不减 */
 function pruneAttempts() {
@@ -50,8 +58,25 @@ router.post('/login', asyncHandler(async (req, res) => {
   if (usernameText.length > MAX_USERNAME_LENGTH) {
     return res.status(400).json({ message: `用户名最多 ${MAX_USERNAME_LENGTH} 个字符` });
   }
-  if (passwordText.length > MAX_PASSWORD_LENGTH) {
-    return res.status(400).json({ message: `密码最多 ${MAX_PASSWORD_LENGTH} 个字符` });
+  if (passwordByteLength(passwordText) > MAX_PASSWORD_BYTES) {
+    return res.status(400).json({ message: PASSWORD_TOO_LONG_MESSAGE });
+  }
+  let db = getDb();
+  // 空库（从未 seed）时给出可操作提示：否则用户面对的是一个永远登不进去的登录页
+  if (!db.users.length) {
+    // seed 是独立进程，只写磁盘；运行中的服务不重读就会一直停在空库，
+    // 用户按提示执行完 npm run seed 依然登不进去（提示成了无效指引）。
+    // 只在「用户表为空」时重读：此状态下不可能有未落盘的改动，重读不会覆盖任何数据。
+    try {
+      db = loadDb();
+    } catch {
+      // 数据文件损坏/版本异常：保持空库状态，继续返回下面这条提示
+    }
+    if (!db.users.length) {
+      return res.status(503).json({
+        message: '系统尚未初始化：当前没有任何账号，请在服务器上执行 npm run seed 后重试登录',
+      });
+    }
   }
   pruneAttempts();
   const ip = clientIp(req);
@@ -70,7 +95,6 @@ router.post('/login', asyncHandler(async (req, res) => {
     return res.status(429).json({ message: `密码错误次数过多，请 ${wait} 秒后重试` });
   }
 
-  const db = getDb();
   const user = db.users.find((u) => u.username.toLowerCase() === usernameKey);
   let ok = false;
   if (user?.passwordHash) {
@@ -98,28 +122,40 @@ router.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
-router.post('/password', requireAuth, (req, res) => {
+router.post('/password', requireAuth, asyncHandler(async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
   if (!oldPassword || !newPassword) {
     return res.status(400).json({ message: '请填写原密码和新密码' });
   }
-  if (String(newPassword).length < 6) {
+  const nextPassword = String(newPassword);
+  if (nextPassword.length < 6) {
     return res.status(400).json({ message: '新密码至少 6 位' });
   }
-  if (!bcrypt.compareSync(String(oldPassword), req.user.passwordHash)) {
+  // 与登录共用同一上限（按字节）：否则密码能设置成功却无法用于登录
+  if (passwordByteLength(nextPassword) > MAX_PASSWORD_BYTES) {
+    return res.status(400).json({ message: PASSWORD_TOO_LONG_MESSAGE });
+  }
+  const oldText = String(oldPassword);
+  let oldOk = false;
+  try {
+    oldOk = await bcrypt.compare(oldText, req.user.passwordHash);
+  } catch {
+    oldOk = false;
+  }
+  if (!oldOk) {
     return res.status(400).json({ message: '原密码不正确' });
   }
-  if (String(newPassword) === String(oldPassword)) {
+  if (nextPassword === oldText) {
     return res.status(400).json({ message: '新密码不能与原密码相同' });
   }
-  req.user.passwordHash = bcrypt.hashSync(String(newPassword), BCRYPT_ROUNDS);
+  req.user.passwordHash = await bcrypt.hash(nextPassword, BCRYPT_ROUNDS);
   req.user.tokenVersion = (req.user.tokenVersion ?? 0) + 1;
   req.user.updatedAt = now();
   saveDbSoon();
   logAction(req.user, '修改密码', '个人中心', '');
   // 旧 token 全部失效；给当前会话补发一个新 token，避免刚改完密码就被踢下线
   res.json({ message: '密码已更新', token: signToken(req.user) });
-});
+}));
 
 router.post('/logout', requireAuth, (req, res) => {
   // 没有服务端会话表，递增 tokenVersion 是让当前用户旧 JWT 立即失效的最简方式。

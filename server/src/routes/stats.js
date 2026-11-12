@@ -61,7 +61,9 @@ router.get('/', (req, res) => {
     byStatus,
     lowStock,
     recentTables,
-    recentLogs: db.logs.slice(0, 12),
+    // 操作日志属管理员可见范围（/api/logs 同样要求管理员）；成员只看自己的最近操作，
+    // 否则统计接口就成了绕开权限矩阵的旁路。
+    recentLogs: (req.user.role === 'admin' ? db.logs : db.logs.filter((l) => l.userId === req.user.id)).slice(0, 12),
     warehouses: Array.from(new Set(db.ledger.map((l) => l.warehouse).filter(Boolean))).sort(),
   });
 });

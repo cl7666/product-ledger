@@ -8,6 +8,30 @@ const TOKEN_TTL = '12h';
 /** bcrypt 计算成本：8 偏低，10 在登录体验与抗暴力破解之间更平衡 */
 export const BCRYPT_ROUNDS = 10;
 
+/**
+ * 登录侧的用户名上限只用于挡住超长输入；建号另有「3-20 位字母数字」的业务规则
+ * （routes/users.js），两者用途不同，不必强行相等。
+ */
+export const MAX_USERNAME_LENGTH = 64;
+
+/**
+ * bcrypt 只使用前 72 字节，超出部分完全不参与校验。上限按 **UTF-8 字节** 收口到 72，
+ * 让「能设置的密码」与「能校验的密码」严格一致：
+ *  - 只在设置侧收口 → 历史超长密码看起来更安全，实际被静默截断；
+ *  - 只在登录侧收口 → 能设置却永远登不进去（账号锁死）。
+ * 因此登录、自助改密、建号、管理员重置四处共用这一个上限。
+ * 升级影响：存量中超过 72 字节的密码将无法登录，需管理员重置（见 README）。
+ */
+export const MAX_PASSWORD_BYTES = 72;
+
+/** 密码长度按字节计，而不是 UTF-16 code unit（一个汉字 3 字节、一个 emoji 4 字节） */
+export function passwordByteLength(text) {
+  return Buffer.byteLength(String(text ?? ''), 'utf8');
+}
+
+/** 登录 / 自助改密 / 建号 / 管理员重置共用的提示语，避免四处文案漂移 */
+export const PASSWORD_TOO_LONG_MESSAGE = `密码不能超过 ${MAX_PASSWORD_BYTES} 字节（UTF-8，约 ${MAX_PASSWORD_BYTES} 个英文字符）`;
+
 function loadSecret() {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
   fs.mkdirSync(DATA_DIR, { recursive: true });

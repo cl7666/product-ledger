@@ -1,7 +1,17 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import { getDb, saveDbSoon, uid, now } from '../db.js';
-import { requireAuth, requireAdmin, publicUser, logAction, BCRYPT_ROUNDS } from '../auth.js';
+import {
+  requireAuth,
+  requireAdmin,
+  publicUser,
+  logAction,
+  BCRYPT_ROUNDS,
+  MAX_PASSWORD_BYTES,
+  PASSWORD_TOO_LONG_MESSAGE,
+  passwordByteLength,
+} from '../auth.js';
+
 
 const router = express.Router();
 router.use(requireAuth);
@@ -28,6 +38,9 @@ router.post('/', requireAdmin, (req, res) => {
   }
   if (!password || String(password).length < 6) {
     return res.status(400).json({ message: '密码至少 6 位' });
+  }
+  if (passwordByteLength(password) > MAX_PASSWORD_BYTES) {
+    return res.status(400).json({ message: PASSWORD_TOO_LONG_MESSAGE });
   }
   if (!['admin', 'member'].includes(role)) {
     return res.status(400).json({ message: '角色不合法' });
@@ -79,6 +92,9 @@ router.patch('/:id', requireAdmin, (req, res) => {
   if (role) user.role = role;
   if (password) {
     if (String(password).length < 6) return res.status(400).json({ message: '密码至少 6 位' });
+    if (passwordByteLength(password) > MAX_PASSWORD_BYTES) {
+      return res.status(400).json({ message: PASSWORD_TOO_LONG_MESSAGE });
+    }
     user.passwordHash = bcrypt.hashSync(String(password), BCRYPT_ROUNDS);
     // 管理员重置密码后，该用户已登录的会话立即失效
     user.tokenVersion = (user.tokenVersion ?? 0) + 1;

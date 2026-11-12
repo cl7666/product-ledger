@@ -25,13 +25,7 @@ try {
 // 启动时只允许在「完全空库」且显式开启 SEED_DEMO 的情况下写入演示数据。
 // 用户为空但业务数据还在，通常意味着 db.json 被改坏或误删了 users，
 // 此时绝不能重新 seed（seed 会 resetDb，导致整库数据被演示数据覆盖）。
-const COLLECTIONS = ['users', 'tables', 'rows', 'ledger', 'logs'];
-const malformed = COLLECTIONS.filter((key) => !Array.isArray(getDb()[key]));
-if (malformed.length) {
-  console.error(`[db] 数据文件结构异常：${malformed.join('、')} 不是数组。为防止覆盖数据，服务已停止。`);
-  process.exit(1);
-}
-
+// 集合必须为数组的校验已在 db.js 的 migrateDb 中完成（seed.js 等入口共用）。
 const startupDb = getDb();
 const hasBusinessData = ['tables', 'rows', 'ledger', 'logs'].some((key) => startupDb[key].length > 0);
 if (!startupDb.users.length && hasBusinessData) {
@@ -83,9 +77,9 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: '1mb' }));
-
 // 可选访问日志：默认关闭，ACCESS_LOG=1 时输出一行 JSON，便于接入日志采集。
+// 必须挂在 express.json 之前：body-parser 的错误（请求体过大 413、非法 JSON 400）
+// 会直接跳到错误处理中间件，注册在其后的普通中间件永远看不到这些请求。
 app.use((req, res, next) => {
   if (process.env.ACCESS_LOG !== '1') return next();
   const startedAt = Date.now();
@@ -102,6 +96,8 @@ app.use((req, res, next) => {
   });
   next();
 });
+
+app.use(express.json({ limit: '1mb' }));
 
 // app 字段用于让启动脚本确认「端口上的 200 确实来自本系统」，而不是别的 HTTP 服务
 app.get('/api/health', (req, res) => {

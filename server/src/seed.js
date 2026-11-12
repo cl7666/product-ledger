@@ -1,6 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import bcrypt from 'bcryptjs';
-import { getDb, loadDb, saveDb, resetDb, uid } from './db.js';
+import { getDb, loadDb, saveDb, resetDb, uid, CURRENT_DB_VERSION } from './db.js';
 import { ledgerAmount } from './ledger-fields.js';
 import { toDateOnly } from './store.js';
 import { BCRYPT_ROUNDS } from './auth.js';
@@ -256,7 +256,12 @@ export function seed({ force = false } = {}) {
     });
   });
   db.logs.sort((a, b) => (a.at < b.at ? 1 : -1));
-  db.meta = { version: 1, createdAt: new Date().toISOString(), seededAt: new Date().toISOString() };
+  // 版本号必须取自常量：硬编码会在升级 CURRENT_DB_VERSION 后写出过期版本
+  db.meta = {
+    version: CURRENT_DB_VERSION,
+    createdAt: new Date().toISOString(),
+    seededAt: new Date().toISOString(),
+  };
 
   saveDb();
   console.log(

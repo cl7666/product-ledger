@@ -80,7 +80,8 @@ export interface Paged<T> {
 export interface LedgerFieldMeta {
   key: string;
   label: string;
-  type: ColumnType;
+  /** 台账字段可能是派生列（如金额），服务端用 type: 'computed' 表达 */
+  type: ColumnType | 'computed';
   width?: number;
   options?: string[];
   computed?: boolean;

@@ -3,7 +3,7 @@ import { Alert, Button, Modal, Select, Tag, App as AntdApp } from 'antd';
 import { TableOutlined } from '@ant-design/icons';
 import { api } from '../api';
 import type { DataTable, LedgerFieldMeta } from '../types';
-import { ledgerFieldGuess } from '../utils';
+import { ledgerFieldGuess, writableLedgerFields } from '../utils';
 
 interface Props {
   open: boolean;
@@ -21,6 +21,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
   const [loading, setLoading] = useState(false);
 
   const table = useMemo(() => tables.find((t) => t.id === tableId) || null, [tables, tableId]);
+  const writable = useMemo(() => writableLedgerFields(fields), [fields]);
 
   useEffect(() => {
     if (!open) return;
@@ -29,7 +30,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
       .then(([tablesData, fieldList]) => {
         const eligible = tablesData.items.filter((t) => t.columns.length > 0);
         setTables(eligible);
-        setFields(fieldList.filter((f) => !f.computed && !f.readOnly));
+        setFields(fieldList);
         if (eligible[0]) {
           setTableId(eligible[0].id);
           autoMap(eligible[0], fieldList);
@@ -39,7 +40,9 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
   }, [open, message]);
 
   const autoMap = (target: DataTable, fieldList: LedgerFieldMeta[]) => {
-    const ledgerKeys = fieldList.filter((f) => !f.computed && !f.readOnly).map((f) => f.key);
+    // 传 {key,label} 而不是 key 数组：ledgerFieldGuess 的后两层（标签相同 / 标签互含）
+    // 依赖真实标签，只传 key 会让它们恒不命中，非产品库存表模板全部匹配不到。
+    const ledgerKeys = writableLedgerFields(fieldList).map((f) => ({ key: f.key, label: f.label }));
     const next: Record<string, string> = {};
     for (const col of target.columns) {
       const key = ledgerFieldGuess(col, ledgerKeys);
@@ -143,7 +146,7 @@ export default function ToTableModal({ open, selectedIds, onCancel, onDone }: Pr
                       return next;
                     })
                   }
-                  options={fields.map((f) => ({ value: f.key, label: f.label }))}
+                  options={writable.map((f) => ({ value: f.key, label: f.label }))}
                 />
               </div>
             ))}

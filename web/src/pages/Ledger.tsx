@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Button,
@@ -88,18 +88,25 @@ export default function Ledger() {
     setKeywordInput(keyword);
   }, [keyword]);
 
+  // 请求序号：快速翻页 / 连续切换排序时，先发的慢响应可能后到并覆盖新结果
+  const loadSeq = useRef(0);
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true);
     try {
       const data = await api.ledger.list({ ...query, page, pageSize });
+      if (seq !== loadSeq.current) return; // 已被更新的请求取代
       setItems(data.items);
       setTotal(data.total);
+      // 多人协作下别人删了数据时，服务端会把越界页码收敛；回写 URL，
+      // 否则 UI 会停在一个空白的第 N 页（TableDetail 早已这么做，此处保持一致）
+      if (data.page !== page) patchUrl({ page: data.page });
     } catch (err) {
-      message.error((err as Error).message);
+      if (seq === loadSeq.current) message.error((err as Error).message);
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
-  }, [query, page, pageSize, message]);
+  }, [query, page, pageSize, message, patchUrl]);
 
   useEffect(() => {
     load();
@@ -232,9 +239,18 @@ export default function Ledger() {
     }
   };
 
+  // 表头箭头必须由 URL 驱动：分享 / 刷新带 sortBy 的链接时，数据已排序但箭头不显示，
+  // 用工具栏下拉切换排序时表头也不联动（TableDetail 已用同一写法）。
+  const orderOf = (key: string): 'ascend' | 'descend' | null =>
+    sortBy === key ? (sortOrder === 'asc' ? 'ascend' : 'descend') : null;
+
   const columns: ColumnsType<LedgerEntry> = [
-    { title: '产品编号', dataIndex: 'code', key: 'code', width: 130, fixed: 'left', sorter: true },
-    { title: '产品名称', dataIndex: 'name', key: 'name', width: 180, fixed: 'left', sorter: true },
+    {
+      title: '产品编号', dataIndex: 'code', key: 'code', width: 130, fixed: 'left', sorter: true, sortOrder: orderOf('code'),
+    },
+    {
+      title: '产品名称', dataIndex: 'name', key: 'name', width: 180, fixed: 'left', sorter: true, sortOrder: orderOf('name'),
+    },
     { title: '规格型号', dataIndex: 'spec', key: 'spec', width: 150, ellipsis: true },
     {
       title: '分类',
@@ -251,6 +267,7 @@ export default function Ledger() {
       width: 110,
       align: 'right',
       sorter: true,
+      sortOrder: orderOf('price'),
       render: (v: number) => formatMoney(v),
     },
     {
@@ -260,6 +277,7 @@ export default function Ledger() {
       width: 100,
       align: 'right',
       sorter: true,
+      sortOrder: orderOf('quantity'),
       render: (v: number) => (
         <span style={{ color: v <= 10 ? '#d9475c' : undefined, fontWeight: v <= 10 ? 600 : undefined }}>
           {formatNumber(v)}
@@ -273,6 +291,7 @@ export default function Ledger() {
       width: 130,
       align: 'right',
       sorter: true,
+      sortOrder: orderOf('amount'),
       render: (v: number) => <span className="amount">{formatMoney(v)}</span>,
     },
     { title: '仓库', dataIndex: 'warehouse', key: 'warehouse', width: 110 },
@@ -305,6 +324,7 @@ export default function Ledger() {
       key: 'updatedAt',
       width: 150,
       sorter: true,
+      sortOrder: orderOf('updatedAt'),
       render: (v: string) => <span className="text-muted">{formatDateTime(v)}</span>,
     },
     {

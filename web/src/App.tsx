@@ -1,6 +1,6 @@
 import { lazy, Suspense } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import { Spin } from 'antd';
+import { Button, Result, Spin } from 'antd';
 import { useAuth } from './auth';
 import AppLayout from './components/AppLayout';
 import ErrorBoundary from './components/ErrorBoundary';
@@ -25,7 +25,7 @@ function RouteFallback() {
 }
 
 function Protected() {
-  const { user, ready } = useAuth();
+  const { user, ready, authError, refresh } = useAuth();
   const location = useLocation();
   if (!ready) {
     return (
@@ -33,6 +33,24 @@ function Protected() {
         <Spin size="large" tip="正在加载…">
           <div style={{ width: 120, height: 40 }} />
         </Spin>
+      </div>
+    );
+  }
+  // 有 token 但拿不到用户信息（后端重启 / 代理 502 / 内网超时）：
+  // 显示可重试的提示，而不是清掉登录态把用户踢回登录页。
+  if (!user && authError) {
+    return (
+      <div className="loading-screen">
+        <Result
+          status="warning"
+          title="服务暂时不可用"
+          subTitle={authError}
+          extra={
+            <Button type="primary" onClick={() => refresh()}>
+              重试
+            </Button>
+          }
+        />
       </div>
     );
   }

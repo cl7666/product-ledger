@@ -14,13 +14,24 @@ function thinBorder() {
   };
 }
 
+/**
+ * 单元格值转文本。Excel 日期是“无时区”的序列值，ExcelJS 按 UTC 还原，这里也按 UTC 取分量，
+ * 避免跨时区部署时日期整体偏移一天。
+ *
+ * 时分秒非零时保留时间部分：导出侧把带时区的绝对时刻换算成本地墙钟写出（见 toExcelDate），
+ * 若这里只取日期，导出→回导就会丢掉时分秒，「导出即可回导」的承诺不再成立。
+ * 用值本身判断而不是解析 numFmt，避免自定义格式 / 条件格式 / 引号转义带来的误判。
+ */
 function cellText(value) {
   if (value === null || value === undefined) return '';
   if (value instanceof Date) {
-    // Excel 日期是"无时区"的序列值，ExcelJS 按 UTC 还原；这里也按 UTC 取日期，
-    // 不再硬编码 +8 小时，避免跨时区部署时日期前后偏移一天。
     const pad = (n) => String(n).padStart(2, '0');
-    return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+    const date = `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+    const h = value.getUTCHours();
+    const mi = value.getUTCMinutes();
+    const s = value.getUTCSeconds();
+    if (!h && !mi && !s) return date;
+    return `${date} ${pad(h)}:${pad(mi)}:${pad(s)}`;
   }
   if (typeof value === 'object') {
     if (Array.isArray(value.richText)) return value.richText.map((t) => t.text).join('');
@@ -47,14 +58,27 @@ function normalizeLabel(text) {
     .toLowerCase();
 }
 
-/** 单列文件常见的“产品清单 / 库存台账”标题行；没有多列特征时用它跳过标题 */
+/**
+ * 单列文件常见的“产品清单 / 库存台账 / 入库明细”标题行；没有多列特征时用它跳过标题。
+ * 前缀只收业务上确实会出现在表名里的词，且必须配合“清单/台账/明细…”这类后缀才命中，
+ * 避免把「入库单号」这类列名或数据值当成标题。
+ */
+const SINGLE_COLUMN_TITLE = /^(?:产品|物料|商品|库存|设备|客户|员工|数据|销售|采购|台账|入库|出库|验收|盘点|调拨|报损|退货|发货|收货).{0,12}(?:清单|列表|台账|明细|汇总表|统计表|表)$/;
+const SINGLE_COLUMN_TITLE_PLAIN = /^(?:清单|列表|台账|明细|数据表|统计表|模板)$/;
+
 function looksLikeSingleColumnTitle(values) {
   if (values.length !== 1) return false;
   const text = String(values[0] ?? '').trim();
-  return (
-    /^(产品|物料|商品|库存|设备|客户|员工|数据|销售|采购|台账).{0,12}(清单|列表|台账|明细|汇总表|统计表|表)$/.test(text) ||
-    /^(清单|列表|台账|明细|数据表|统计表|模板)$/.test(text)
-  );
+  return SINGLE_COLUMN_TITLE.test(text) || SINGLE_COLUMN_TITLE_PLAIN.test(text);
+}
+
+/**
+ * 值“像数据”而不是“像列名”：带数字（A-100 / 120 / 2026-11-11）的单元格基本可断定是数据行。
+ * 不能用“字符类别形状是否相同”来判断——中文列名和中文数据在字符类别上完全同构
+ * （「产品名称」与「无线鼠标」都是 4 个汉字），那样等于永远判定同构。
+ */
+function looksLikeDataValue(value) {
+  return /\d/.test(String(value ?? '').trim());
 }
 
 function detectHeaderRow(cleaned, width, expectedLabels = []) {
@@ -87,14 +111,23 @@ function detectHeaderRow(cleaned, width, expectedLabels = []) {
         bestIndex = item.index;
       }
     }
-    if (bestIndex >= 0 && bestScore >= Math.min(2, wanted.length)) return bestIndex;
+    // 单列文件只有一个单元格可评分，阈值必须降到 1：否则永远够不到 2 分，
+    // 「标题 + 表头」这类单列文件会整片回落到下方的启发式判断。
+    const minScore = Math.min(width === 1 ? 1 : 2, wanted.length);
+    if (bestIndex >= 0 && bestScore >= minScore) return bestIndex;
   }
 
   if (width === 1) {
     const nonEmpty = stats.filter((item) => item.filled > 0);
-    if (nonEmpty.length >= 2) {
+    // 至少要有「标题 + 表头 + 1 行数据」才值得跳过标题；否则跳过会得到 0 行数据，不如把首行当表头
+    if (nonEmpty.length >= 3) {
       const firstValues = cleaned[nonEmpty[0].index].map((v) => String(v ?? '').trim()).filter(Boolean);
-      if (looksLikeSingleColumnTitle(firstValues)) return nonEmpty[1].index;
+      const nextText = String(cleaned[nonEmpty[1].index][0] ?? '').trim();
+      // 首行像标题时，还要确认第二行确实“像列名”才跳过：第二行带数字/编码（A-100）说明它是
+      // 数据行，此时首行只能是表头——列名恰好叫「库存明细」这类词时，跳过会连带丢掉首行数据。
+      if (looksLikeSingleColumnTitle(firstValues) && !looksLikeDataValue(nextText)) {
+        return nonEmpty[1].index;
+      }
     }
   }
 
@@ -126,7 +159,14 @@ function isSummaryRow(row) {
   return others.length === 0 || others.every((v) => Number.isFinite(Number(v)));
 }
 
-/** 解析上传的 Excel，返回 [{ name, headers, rows: string[][], totalRows, truncated }] */
+/**
+ * 解析上传的 Excel。
+ * 每个工作表返回：
+ *  - name / headers / rows（已去掉标题、副标题、合计与说明行）
+ *  - rowNumbers：与 rows 一一对应的**真实 Excel 行号**，导入报错用它定位
+ *  - headerRow：表头所在行号；dataStartRow：首条数据行号（两者都可能是“非 1 起步”）
+ *  - totalRows：去噪后的数据行总数（可能大于 rows.length）；truncated：是否超过 maxRows
+ */
 export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [] } = {}) {
   const wb = new ExcelJS.Workbook();
   try {
@@ -146,6 +186,8 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
       throw new HttpError(400, `工作表数量超过上限（${MAX_SHEETS} 个），请拆分文件`);
     }
     const matrix = [];
+    // 与 matrix 一一对应的真实 Excel 行号：空行、合计行会让“清洗后的下标”与用户看到的行号脱钩
+    const matrixRowNumbers = [];
     ws.eachRow({ includeEmpty: false }, (row) => {
       const values = [];
       row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
@@ -156,9 +198,16 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
         throw new HttpError(400, `Excel 单元格数量超过上限（${MAX_CELLS} 个），请拆分文件`);
       }
       matrix.push(Array.from(values, (v) => (v === undefined ? '' : v)));
+      matrixRowNumbers.push(row.number);
     });
-    // 去掉整行/整列都为空的数据
-    const cleaned = matrix.filter((r) => r.some((c) => c !== ''));
+    // 去掉整行/整列都为空的数据（同时丢掉对应的行号）
+    const cleaned = [];
+    const cleanedRowNumbers = [];
+    for (let i = 0; i < matrix.length; i += 1) {
+      if (!matrix[i].some((c) => c !== '')) continue;
+      cleaned.push(matrix[i]);
+      cleanedRowNumbers.push(matrixRowNumbers[i]);
+    }
     if (cleaned.length < 1) return;
     const width = cleaned.reduce((max, r) => Math.max(max, r.length), 0);
     const headerIndex = detectHeaderRow(cleaned, width, expectedLabels);
@@ -176,6 +225,7 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
       headers.push(label);
     }
     const bodyAll = [];
+    const bodyRowNumbers = [];
     for (let i = headerIndex + 1; i < cleaned.length; i += 1) {
       const row = cleaned[i];
       if (!row.some((c) => String(c ?? '').trim() !== '')) continue;
@@ -185,46 +235,96 @@ export async function parseWorkbook(buffer, { maxRows = 5000, expectedLabels = [
       // 说明行只可能出现在文件末尾；中间行即使以“说明：”开头也按数据处理
       if (i === cleaned.length - 1 && isFooterNote(row)) continue;
       bodyAll.push(Array.from({ length: width }, (_, ci) => row[ci] ?? ''));
+      bodyRowNumbers.push(cleanedRowNumbers[i]);
     }
     const rows = bodyAll.slice(0, maxRows);
+    const rowNumbers = bodyRowNumbers.slice(0, maxRows);
+    const headerRow = cleanedRowNumbers[headerIndex] ?? headerIndex + 1;
     sheets.push({
       name: ws.name,
       headers,
       rows,
+      // 与 rows 一一对应的 Excel 行号，导入报错时直接用它定位
+      rowNumbers,
       totalRows: bodyAll.length,
-      // 数据第一行在 Excel 中的 1-based 行号，用于把错误定位到用户看到的行
-      dataStartRow: headerIndex + 2,
+      // 表头所在的真实 Excel 行号（1-based）
+      headerRow,
+      // 数据第一行的真实行号：表头与首条数据之间若有空行，简单 +1 会算错
+      dataStartRow: rowNumbers[0] ?? headerRow + 1,
       truncated: bodyAll.length > maxRows,
     });
   });
   return sheets;
 }
 
+const EXCEL_DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+const EXCEL_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,3})?(?:Z|[+-]\d{2}:?\d{2})?$/;
+const EXCEL_HAS_ZONE = /(?:Z|[+-]\d{2}:?\d{2})$/;
+
 /**
- * 把 YYYY-MM-DD / YYYY-MM-DD HH:mm:ss 转成 Excel 可识别的日期。
- * 按 UTC 分量构造，避免导出机器的时区把日期整体前移/后移一天。
+ * 把 YYYY-MM-DD / YYYY-MM-DD HH:mm:ss / ISO-8601 转成 Excel 可识别的日期。
+ * Excel 的日期是“无时区的序列号”，由 ExcelJS 按 Date 的 UTC 分量换算，因此：
+ *  - 纯日期与不带时区的本地墙钟串：直接按分量构造 UTC，写出后与原文一致；
+ *  - 带时区（系统时间戳 now() 的 ...Z）：必须先换算成本地时间再取分量，
+ *    否则会把 UTC 墙钟当成本地时间写出，在东八区整整早 8 小时。
  */
+/**
+ * 分量是否构成真实存在的日期时间。
+ * `Date.UTC(2026, 12, 45)` 会把 13 月 45 日顺延成 2027-02-14，脏数据因此被悄悄改写成
+ * 一个“看起来合法”的日期；必须回读分量比对，和 query.js 的 comparable() 保持同一标准。
+ */
+function hasValidDateParts(y, mo, d, h, mi, s) {
+  const probe = new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+  if (Number.isNaN(probe.getTime())) return false;
+  return (
+    probe.getUTCFullYear() === y &&
+    probe.getUTCMonth() === mo - 1 &&
+    probe.getUTCDate() === d &&
+    probe.getUTCHours() === h &&
+    probe.getUTCMinutes() === mi &&
+    probe.getUTCSeconds() === s
+  );
+}
+
 function toExcelDate(value) {
   const text = String(value ?? '').trim();
   if (!text) return null;
-  let m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  let m = EXCEL_DATE_ONLY.exec(text);
   if (m) {
-    const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
-    return Number.isNaN(d.getTime()) ? null : { value: d, numFmt: 'yyyy-mm-dd' };
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    // 非法日期返回 null，由调用方按文本原样写出（与 number 列脏数据策略一致），
+    // 不能让它顺延成另一个日期——回导后会变成一条看似正常的错误数据。
+    if (!hasValidDateParts(y, mo, d, 0, 0, 0)) return null;
+    return { value: new Date(Date.UTC(y, mo - 1, d)), numFmt: 'yyyy-mm-dd' };
   }
-  m = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
-  if (m) {
-    const d = new Date(Date.UTC(
-      Number(m[1]),
-      Number(m[2]) - 1,
-      Number(m[3]),
-      Number(m[4]),
-      Number(m[5]),
-      Number(m[6] || 0),
+  m = EXCEL_DATE_TIME.exec(text);
+  if (!m) return null;
+  let d;
+  if (EXCEL_HAS_ZONE.test(text)) {
+    const ts = Date.parse(text.replace(' ', 'T'));
+    if (Number.isNaN(ts)) return null;
+    const local = new Date(ts);
+    d = new Date(Date.UTC(
+      local.getFullYear(),
+      local.getMonth(),
+      local.getDate(),
+      local.getHours(),
+      local.getMinutes(),
+      local.getSeconds(),
     ));
-    return Number.isNaN(d.getTime()) ? null : { value: d, numFmt: 'yyyy-mm-dd hh:mm:ss' };
+  } else {
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const day = Number(m[3]);
+    const h = Number(m[4]);
+    const mi = Number(m[5]);
+    const s = Number(m[6] || 0);
+    if (!hasValidDateParts(y, mo, day, h, mi, s)) return null;
+    d = new Date(Date.UTC(y, mo - 1, day, h, mi, s));
   }
-  return null;
+  return Number.isNaN(d.getTime()) ? null : { value: d, numFmt: 'yyyy-mm-dd hh:mm:ss' };
 }
 
 /**

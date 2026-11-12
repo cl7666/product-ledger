@@ -121,24 +121,35 @@ export default function TableDetail() {
     event.stopPropagation();
     const startX = event.clientX;
     let width = startWidth;
+    let frame = 0;
     const onMove = (e: MouseEvent) => {
       width = Math.round(Math.max(80, Math.min(480, startWidth + e.clientX - startX)));
-      setResizing({ key, width });
+      // 每帧最多提交一次：高回报率鼠标每秒会发 100~1000 个 mousemove，
+      // 逐个 setState 会不断重建列定义并触发整表 diff，拖 20 列 × 100 行时肉眼可见掉帧。
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        setResizing({ key, width });
+      });
     };
-    const onUp = () => {
+    const stop = () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
       resizeCleanup.current = null;
+    };
+    const onUp = () => {
+      stop();
       setResizing(null);
       const columns = meta.columns.map((c) => (c.key === key ? { ...c, width } : c));
       saveColumns(columns, `列宽已保存为 ${width}px`);
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-    resizeCleanup.current = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
+    resizeCleanup.current = stop;
   };
 
   const dropColumn = (targetKey: string) => {
@@ -180,8 +191,11 @@ export default function TableDetail() {
     }
   }, [id, message, navigate]);
 
+  // 请求序号：快速翻页 / 连续改排序时，先发的慢响应可能后到并覆盖新结果
+  const rowsSeq = useRef(0);
   const loadRows = useCallback(async () => {
     if (!id) return;
+    const seq = ++rowsSeq.current;
     setLoading(true);
     try {
       const data = await api.tables.rows(id, {
@@ -192,14 +206,16 @@ export default function TableDetail() {
         page,
         pageSize,
       });
+      if (seq !== rowsSeq.current) return; // 已被更新的请求取代，丢弃这次结果
       setRows(data.items);
       setTotal(data.total);
       // 服务端会把越界页码收敛到最后一页；回写 URL，避免 UI 停在空白页
       if (data.page !== page) patchUrl({ page: data.page });
     } catch (err) {
-      message.error((err as Error).message);
+      if (seq === rowsSeq.current) message.error((err as Error).message);
     } finally {
-      setLoading(false);
+      // 只有最后一次请求才有权结束 loading，否则旧请求会把新请求的加载态提前关掉
+      if (seq === rowsSeq.current) setLoading(false);
     }
   }, [id, keyword, filters, sort, page, pageSize, message, patchUrl]);
 

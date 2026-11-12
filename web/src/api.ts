@@ -163,7 +163,8 @@ export const api = {
           created: number;
           updated: number;
           skipped: number;
-          errors?: { row: string; code?: string; message: string }[];
+          // row 是「本次同步的第几条」，便于用户对回表格中的具体行
+          errors?: { row: number; code?: string; message: string }[];
           errorsTruncated?: boolean;
           message: string;
         }>(`/tables/${id}/sync-ledger`, body)

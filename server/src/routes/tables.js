@@ -391,8 +391,11 @@ router.post('/:id/import/commit', (req, res) => {
   if (pairs.some(([, idx]) => idx >= source.headers.length)) {
     throw new HttpError(400, '映射的列超出了该工作表的表头范围，请重新上传并选择正确的工作表');
   }
-  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2
+  // dataStartRow 是 Excel 中第一条数据所在行（1-based），错误行号不能固定写 2；
+  // rowNumbers 与解析后的 rows 一一对应，能覆盖空行、合计行造成的行号跳变
   const dataStartRow = Number.isInteger(source.dataStartRow) && source.dataStartRow > 0 ? source.dataStartRow : 2;
+  const rowNumberOf = (i) =>
+    (Array.isArray(source.rowNumbers) && Number.isInteger(source.rowNumbers[i]) ? source.rowNumbers[i] : dataStartRow + i);
   const dedupeLabel = table.columns.find((c) => c.key === dedupeKey)?.label || '匹配字段';
 
   const db = getDb();
@@ -433,7 +436,7 @@ router.post('/:id/import/commit', (req, res) => {
     });
     if (badNumber) {
       const col = table.columns.find((c) => c.key === badNumber[0]);
-      fail(dataStartRow + index, `「${col.label}」不是有效数字：${cells[badNumber[1]]}`);
+      fail(rowNumberOf(index), `「${col.label}」不是有效数字：${cells[badNumber[1]]}`);
       return;
     }
     if (mode === 'upsert' && dedupeKey) {
@@ -441,14 +444,14 @@ router.post('/:id/import/commit', (req, res) => {
       const normalizedKey = normalizeRowPatch(table, { [dedupeKey]: input[dedupeKey] })[dedupeKey];
       const key = String(normalizedKey ?? '').trim().toLowerCase();
       if (!key) {
-        fail(dataStartRow + index, `「${dedupeLabel}」为空，无法判断是否与已有数据重复`);
+        fail(rowNumberOf(index), `「${dedupeLabel}」为空，无法判断是否与已有数据重复`);
         return;
       }
       if (existing.has(key)) {
         const target = existing.get(key);
         // 行级权限：与单条 PATCH 保持一致，导入也不能覆盖别人录入的数据
         if (!canEditRow(req.user, table, target)) {
-          fail(dataStartRow + index, '无权覆盖他人录入的数据，可联系表格创建者或管理员处理');
+          fail(rowNumberOf(index), '无权覆盖他人录入的数据，可联系表格创建者或管理员处理');
           return;
         }
         // 只合并"本次实际映射且非空"的列：未映射列和空单元格都保持原值
@@ -456,7 +459,7 @@ router.post('/:id/import/commit', (req, res) => {
         const merged = { ...target.data, ...patch };
         const mergedErrors = validateRow(table, merged);
         if (mergedErrors.length) {
-          fail(dataStartRow + index, mergedErrors.join('；'));
+          fail(rowNumberOf(index), mergedErrors.join('；'));
           return;
         }
         target.data = merged;
@@ -469,7 +472,7 @@ router.post('/:id/import/commit', (req, res) => {
     const data = normalizeRowData(table, input);
     const rowErrors = validateRow(table, data);
     if (rowErrors.length) {
-      fail(dataStartRow + index, rowErrors.join('；'));
+      fail(rowNumberOf(index), rowErrors.join('；'));
       return;
     }
     const row = {
@@ -595,12 +598,16 @@ router.post('/:id/sync-ledger', (req, res) => {
   let updated = 0;
   let skippedCount = 0;
   const skipped = [];
-  const skip = (row, code, message) => {
+  // 行号取「本次同步的第几条」而不是库内 row.id：id 对用户没有意义，
+  // 弹窗里需要能让用户对回表格中的具体那一行。
+  const skip = (rowNo, code, message) => {
     skippedCount += 1;
-    if (skipped.length < 30) skipped.push({ row: row.id, code, message });
+    if (skipped.length < 30) skipped.push({ row: rowNo, code, message });
   };
 
-  for (const row of rows) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
+    const rowNo = rowIndex + 1;
     const input = {};
     for (const [ledgerKey, colKey] of pairs) input[ledgerKey] = row.data[colKey];
     let payload;
@@ -610,18 +617,18 @@ router.post('/:id/sync-ledger', (req, res) => {
       // 避免把别人的单价/备注清成 0 / 空串；新增记录的默认值在下方 entry 构造时兜底
       payload = readLedgerPayload(input, { skipEmpty: true });
     } catch (err) {
-      skip(row, String(input.code ?? ''), err.message);
+      skip(rowNo, String(input.code ?? ''), err.message);
       continue;
     }
     const code = String(payload.code ?? '').trim();
     const name = String(payload.name ?? '').trim();
     if (!code && !name) {
-      skip(row, '', '产品编号与产品名称均为空');
+      skip(rowNo, '', '产品编号与产品名称均为空');
       continue;
     }
     // 按编号更新但没有编号：与台账 Excel 导入保持一致，按行跳过而不是生成 AUTO 编号
     if (mode === 'upsert' && !code) {
-      skip(row, '', '产品编号为空，无法按编号匹配更新');
+      skip(rowNo, '', '产品编号为空，无法按编号匹配更新');
       continue;
     }
     let target = null;
@@ -631,13 +638,13 @@ router.post('/:id/sync-ledger', (req, res) => {
     if (target) {
       // 与单条 PATCH / Excel 导入同一规则：成员不能覆盖他人录入的台账
       if (!canEditLedger(req.user, target)) {
-        skip(row, code, '无权覆盖他人录入的台账，可联系管理员处理');
+        skip(rowNo, code, '无权覆盖他人录入的台账，可联系管理员处理');
         continue;
       }
       try {
         validateLedgerEntry({ ...target, ...payload });
       } catch (err) {
-        skip(row, code, err.message);
+        skip(rowNo, code, err.message);
         continue;
       }
       Object.assign(target, payload, { updatedAt: now(), updatedBy: req.user.id });
@@ -647,7 +654,7 @@ router.post('/:id/sync-ledger', (req, res) => {
     // 新增分支同样要守住"产品编号唯一"：insert 模式也允许按编号更新之外的场景，
     // 但不能凭空制造两条同编号台账
     if (code && db.ledger.some((l) => String(l.code).toLowerCase() === code.toLowerCase())) {
-      skip(row, code, '台账中已存在相同产品编号，请改用「按编号更新」或修改编号');
+      skip(rowNo, code, '台账中已存在相同产品编号，请改用「按编号更新」或修改编号');
       continue;
     }
     const entry = {
@@ -672,7 +679,7 @@ router.post('/:id/sync-ledger', (req, res) => {
     try {
       validateLedgerEntry(entry);
     } catch (err) {
-      skip(row, code, err.message);
+      skip(rowNo, code, err.message);
       continue;
     }
     db.ledger.push(entry);
@@ -699,7 +706,10 @@ router.post('/:id/sync-ledger', (req, res) => {
 
 /* ---------- 台账字段元数据（供前端映射用） ---------- */
 router.get('/meta/ledger-fields', (req, res) => {
-  res.json({ fields: LEDGER_FIELDS });
+  // 显式下发 computed 标记：派生列在服务端只由 type: 'computed' 表达，
+  // 前端若按不存在的布尔字段过滤，就会把「金额(元)」当成可映射字段，
+  // 而写入时这些映射对会被 LEDGER_WRITABLE_FIELDS 静默丢弃。
+  res.json({ fields: LEDGER_FIELDS.map((f) => ({ ...f, computed: f.type === 'computed' })) });
 });
 
 export default router;

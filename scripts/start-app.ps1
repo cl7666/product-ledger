@@ -42,6 +42,23 @@ function Test-ServiceUp([int]$p) {
   } catch { return $false }
 }
 
+# 空库（从未执行过 seed）时任何账号都登不进去：先给可操作提示，再把用户送到登录页
+function Test-NeedsSeed([int]$p) {
+  try {
+    $body = (Invoke-WebRequest "http://127.0.0.1:$p/api/health" -UseBasicParsing -TimeoutSec 2).Content | ConvertFrom-Json
+    if (-not $body.db) { return $false }
+    return ([int]$body.db.users -eq 0)
+  } catch { return $false }
+}
+
+function Show-SeedHint {
+  Write-Host ''
+  Write-Host '！数据库里还没有任何账号，直接登录会失败。' -ForegroundColor Yellow
+  Write-Host '  请在项目目录另开一个窗口执行一次： npm run seed' -ForegroundColor Yellow
+  Write-Host '  执行完成后回到浏览器重新登录即可（服务会自动重新读取数据库，无需重启）。' -ForegroundColor Yellow
+  Write-Host '  （若这里本该有正式数据，请先从备份恢复 server\data\db.json，不要执行 seed）' -ForegroundColor DarkGray
+}
+
 # 端口就绪后从监听套接字反查真实 PID，写进按端口隔离的 PID 文件
 function Save-ListenerPid([int]$p, [string]$file) {
   $listener = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -116,6 +133,7 @@ if (Test-PortOpen $Port) {
   if (Test-ServiceUp $Port) {
     Write-Host "服务已经在运行（端口 $Port），直接打开页面。" -ForegroundColor Yellow
     [void](Save-ListenerPid $Port $pidFile)
+    if (Test-NeedsSeed $Port) { Show-SeedHint }
     if (-not $NoBrowser) { Start-Process $url }
     Show-Lan
     Start-Sleep -Seconds 2
@@ -196,6 +214,7 @@ if (-not $ok) {
 Write-Host ''
 Write-Host '✓ 启动成功' -ForegroundColor Green
 Write-Host "  本机地址：$url" -ForegroundColor White
+if (Test-NeedsSeed $Port) { Show-SeedHint }
 if (-not $NoBrowser) { Start-Process $url }
 Show-Lan
 Write-Host ''
